@@ -1,0 +1,5 @@
+Suggested GitHub repository description:
+TVTest plugin for silent viewing reservation channel switching with BonDriver cross-switch support.
+
+Suggested topics:
+tvtest, bondriver, tvrock, plugin, cpp, windows, epg
