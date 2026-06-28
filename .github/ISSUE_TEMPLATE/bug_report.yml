@@ -1,0 +1,40 @@
+name: Bug report
+description: ViewReservation の不具合報告
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: ViewReservation version
+      placeholder: v1.8.0
+    validations:
+      required: true
+  - type: input
+    id: tvtest
+    attributes:
+      label: TVTest version
+      placeholder: 0.10.0 or later
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      options:
+        - x64
+        - x86
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: 再現手順を書いてください。
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / ini
+      description: TVTest ログや ViewReservation.ini の関連部分を貼ってください。

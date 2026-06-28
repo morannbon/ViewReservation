@@ -1,0 +1,17 @@
+name: Feature request
+description: ViewReservation の改善提案
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: request
+    attributes:
+      label: Request
+      description: 欲しい改善内容を書いてください。
+    validations:
+      required: true
+  - type: textarea
+    id: reason
+    attributes:
+      label: Reason
+      description: その改善が必要な理由を書いてください。

@@ -4,8 +4,6 @@
 #include <string>
 #include <vector>
 #include <mutex>
-#include <optional>
-#include <chrono>
 
 struct ReservationItem {
     WORD NetworkID = 0;
@@ -23,6 +21,7 @@ struct ReservationItem {
     std::wstring EventName;
 
     bool Triggered = false;
+    bool RecordOnTrigger = false;   // true = 録画予約
     int RescueState = 0;
     ULONGLONG LastEpgSyncTick = 0;
     ULONGLONG LastRescueTick = 0;
@@ -40,7 +39,6 @@ public:
     void RemoveExpired();
 
     bool IsReserved(WORD nid, WORD tsid, WORD sid, WORD eid) const;
-    bool ToggleReservation(const ReservationItem &item, std::wstring *message = nullptr);
     bool AddOrUpdateReservation(const ReservationItem &item, std::wstring *message = nullptr);
     bool RemoveReservation(WORD nid, WORD tsid, WORD sid, WORD eid, std::wstring *message = nullptr);
 
@@ -55,6 +53,8 @@ public:
         WORD oldNid, WORD oldTsid, WORD oldSid, WORD oldEid,
         const ReservationItem &replacement,
         std::wstring *message = nullptr);
+    void TouchEpgSync(WORD nid, WORD tsid, WORD sid, WORD eid, ULONGLONG tick);
+    void TouchRescue(WORD nid, WORD tsid, WORD sid, WORD eid, ULONGLONG tick);
 
 private:
     std::wstring m_iniPath;
@@ -63,6 +63,7 @@ private:
 
     static bool SameIdentity(const ReservationItem &a, WORD nid, WORD tsid, WORD sid, WORD eid);
     static bool SameStart(const ReservationItem &a, const ReservationItem &b);
+    static bool SameProgramSlot(const ReservationItem &a, const ReservationItem &b);
     static ULONGLONG ToFileTimeValue(const SYSTEMTIME &st);
     static std::wstring FormatDateTime(const SYSTEMTIME &st);
     static bool ParseDateTime(const std::wstring &text, SYSTEMTIME *st);

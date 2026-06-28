@@ -3,7 +3,6 @@
 #include <windows.h>
 #include <string>
 #include <vector>
-#include <unordered_map>
 #include <chrono>
 
 #include "TVTestPlugin.h"
