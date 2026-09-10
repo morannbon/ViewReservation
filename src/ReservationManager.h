@@ -66,6 +66,8 @@ private:
     static bool SameProgramSlot(const ReservationItem &a, const ReservationItem &b);
     static ULONGLONG ToFileTimeValue(const SYSTEMTIME &st);
     static std::wstring FormatDateTime(const SYSTEMTIME &st);
+    static std::wstring FormatTimeRange(const ReservationItem &item);
+    static bool TimeRangesOverlap(const ReservationItem &a, const ReservationItem &b);
     static bool ParseDateTime(const std::wstring &text, SYSTEMTIME *st);
 
     void SaveUnlocked() const;

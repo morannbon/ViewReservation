@@ -3,6 +3,7 @@
 #include <algorithm>
 
 void DriverCache::Invalidate() {
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_valid = false;
 }
 
@@ -10,6 +11,8 @@ void DriverCache::RebuildIfNeeded(TVTest::CTVTestApp *app, bool force) {
     if (app == nullptr) {
         return;
     }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
 
     const auto now = std::chrono::steady_clock::now();
     if (!force && m_valid && (now - m_lastBuild) < std::chrono::minutes(30)) {
@@ -50,6 +53,8 @@ void DriverCache::RebuildIfNeeded(TVTest::CTVTestApp *app, bool force) {
                 entry.NetworkID = ch->NetworkID;
                 entry.TransportStreamID = ch->TransportStreamID;
                 entry.ServiceID = ch->ServiceID;
+                entry.SpaceType = space->pInfo != nullptr ? space->pInfo->Space : TVTest::TUNINGSPACE_UNKNOWN;
+                entry.ChannelName = ch->szChannelName;
                 entries.push_back(entry);
             }
         }
@@ -63,6 +68,7 @@ void DriverCache::RebuildIfNeeded(TVTest::CTVTestApp *app, bool force) {
 }
 
 bool DriverCache::FindExact(WORD nid, WORD tsid, WORD sid, DriverChannelEntry *out) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
     for (const auto &entry : m_entries) {
         if (entry.NetworkID == nid &&
             entry.TransportStreamID == tsid &&
@@ -77,6 +83,7 @@ bool DriverCache::FindExact(WORD nid, WORD tsid, WORD sid, DriverChannelEntry *o
 }
 
 std::vector<DriverChannelEntry> DriverCache::FindByNetwork(WORD nid) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
     std::vector<DriverChannelEntry> result;
     for (const auto &entry : m_entries) {
         if (entry.NetworkID == nid) {
@@ -87,5 +94,6 @@ std::vector<DriverChannelEntry> DriverCache::FindByNetwork(WORD nid) const {
 }
 
 std::vector<DriverChannelEntry> DriverCache::Snapshot() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
     return m_entries;
 }

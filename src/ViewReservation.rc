@@ -1,0 +1,33 @@
+#include <windows.h>
+#include "Version.h"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION VIEWRESERVATION_VERSION_COMMA
+ PRODUCTVERSION VIEWRESERVATION_VERSION_COMMA
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x1L
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS 0x40004L
+ FILETYPE 0x2L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041104B0"
+        BEGIN
+            VALUE "FileDescription", "ViewReservation TVTest Plugin\0"
+            VALUE "FileVersion", VIEWRESERVATION_VERSION_STRING "\0"
+            VALUE "InternalName", "ViewReservation.tvtp\0"
+            VALUE "OriginalFilename", "ViewReservation.tvtp\0"
+            VALUE "ProductName", "ViewReservation\0"
+            VALUE "ProductVersion", VIEWRESERVATION_VERSION_STRING "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0411, 1200
+    END
+END

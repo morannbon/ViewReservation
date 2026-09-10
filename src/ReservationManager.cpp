@@ -74,6 +74,36 @@ std::wstring ReservationManager::FormatDateTime(const SYSTEMTIME &st) {
     return oss.str();
 }
 
+std::wstring ReservationManager::FormatTimeRange(const ReservationItem &item) {
+    SYSTEMTIME endTime = item.StartTime;
+    FILETIME startFileTime{};
+    if (SystemTimeToFileTime(&item.StartTime, &startFileTime)) {
+        ULARGE_INTEGER value{};
+        value.LowPart = startFileTime.dwLowDateTime;
+        value.HighPart = startFileTime.dwHighDateTime;
+        value.QuadPart += static_cast<ULONGLONG>(item.Duration) * 10000000ULL;
+        FILETIME endFileTime{};
+        endFileTime.dwLowDateTime = value.LowPart;
+        endFileTime.dwHighDateTime = value.HighPart;
+        FileTimeToSystemTime(&endFileTime, &endTime);
+    }
+
+    wchar_t text[32]{};
+    swprintf_s(
+        text, L"%02u:%02u-%02u:%02u",
+        item.StartTime.wHour, item.StartTime.wMinute,
+        endTime.wHour, endTime.wMinute);
+    return text;
+}
+
+bool ReservationManager::TimeRangesOverlap(const ReservationItem &a, const ReservationItem &b) {
+    const ULONGLONG aStart = ToFileTimeValue(a.StartTime);
+    const ULONGLONG bStart = ToFileTimeValue(b.StartTime);
+    const ULONGLONG aEnd = aStart + static_cast<ULONGLONG>(a.Duration) * 10000000ULL;
+    const ULONGLONG bEnd = bStart + static_cast<ULONGLONG>(b.Duration) * 10000000ULL;
+    return aStart < bEnd && bStart < aEnd;
+}
+
 bool ReservationManager::ParseDateTime(const std::wstring &text, SYSTEMTIME *st) {
     if (st == nullptr) {
         return false;
@@ -235,6 +265,47 @@ bool ReservationManager::IsReserved(WORD nid, WORD tsid, WORD sid, WORD eid) con
 
 bool ReservationManager::AddOrUpdateReservation(const ReservationItem &item, std::wstring *message) {
     std::lock_guard<std::mutex> lock(m_mutex);
+
+    // 期限切れ予約は競合判定の対象にしない。
+    RemoveExpiredUnlocked();
+
+    // 同一予約の更新（EPG追従や視聴→録画への種別変更）は自分自身を除外し、
+    // それ以外の録画予約と時間帯が重なる場合だけ拒否する。
+    const ReservationItem *updateTarget = nullptr;
+    for (const auto &existing : m_items) {
+        if (SameIdentity(existing, item.NetworkID, item.TransportStreamID, item.ServiceID, item.EventID)) {
+            updateTarget = &existing;
+            break;
+        }
+    }
+    if (updateTarget == nullptr) {
+        for (const auto &existing : m_items) {
+            if (SameProgramSlot(existing, item)) {
+                updateTarget = &existing;
+                break;
+            }
+        }
+    }
+
+    if (item.RecordOnTrigger) {
+        for (const auto &existing : m_items) {
+            if (&existing == updateTarget || !existing.RecordOnTrigger || existing.Duration == 0) {
+                continue;
+            }
+            if (!TimeRangesOverlap(existing, item)) {
+                continue;
+            }
+
+            if (message != nullptr) {
+                *message =
+                    L"録画予約が重なっています。\r\n"
+                    L"既存: " + FormatTimeRange(existing) + L" 「" + existing.EventName + L"」\r\n" +
+                    L"追加: " + FormatTimeRange(item) + L" 「" + item.EventName + L"」\r\n"
+                    L"この録画予約は追加しませんでした。";
+            }
+            return false;
+        }
+    }
 
     for (auto &existing : m_items) {
         if (SameIdentity(existing, item.NetworkID, item.TransportStreamID, item.ServiceID, item.EventID)) {

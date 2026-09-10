@@ -92,11 +92,15 @@
     <ClInclude Include="src\ReservationManager.h" />
     <ClInclude Include="src\TVTestPlugin.h" />
     <ClInclude Include="src\ViewReservationPlugin.h" />
+    <ClInclude Include="src\Version.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\DriverCache.cpp" />
     <ClCompile Include="src\ReservationManager.cpp" />
     <ClCompile Include="src\ViewReservation.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\ViewReservation.rc" />
   </ItemGroup>
   <ItemGroup>
     <None Include="README.txt" />

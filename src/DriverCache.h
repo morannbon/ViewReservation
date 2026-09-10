@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <mutex>
 
 #include "TVTestPlugin.h"
 
@@ -14,6 +15,8 @@ struct DriverChannelEntry {
     WORD NetworkID = 0;
     WORD TransportStreamID = 0;
     WORD ServiceID = 0;
+    TVTest::TuningSpaceType SpaceType = TVTest::TUNINGSPACE_UNKNOWN;
+    std::wstring ChannelName;
 };
 
 class DriverCache {
@@ -25,6 +28,7 @@ public:
     std::vector<DriverChannelEntry> Snapshot() const;
 
 private:
+    mutable std::mutex m_mutex;
     std::vector<DriverChannelEntry> m_entries;
     std::chrono::steady_clock::time_point m_lastBuild{};
     bool m_valid = false;

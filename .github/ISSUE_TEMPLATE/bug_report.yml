@@ -7,7 +7,7 @@ body:
     id: version
     attributes:
       label: ViewReservation version
-      placeholder: v1.8.0
+      placeholder: v1.8.1
     validations:
       required: true
   - type: input
