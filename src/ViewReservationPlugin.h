@@ -61,8 +61,8 @@ private:
     static constexpr int kPanelArrowVisualWidth = 24;
     static constexpr int kPanelReservationVisualWidth = 18;
     static constexpr int kPanelArrowHitWidth = 38;
-    static constexpr int kPanelTimeColumnWidth = 58;
-    static constexpr int kPanelTitleGap = 4;
+    static constexpr int kPanelTimeColumnPadding = 6;
+    static constexpr int kPanelTitleGap = 6;
     static constexpr ULONGLONG kPanelFutureHorizonSec = 6ULL * 60ULL * 60ULL;
     static constexpr int kControlWaveGr = 1001;
     static constexpr int kControlWaveBs = 1002;
@@ -109,6 +109,14 @@ private:
         std::wstring DisplayText;
     };
 
+    struct PanelRowLayout {
+        RECT Content{};
+        RECT Reservation{};
+        RECT Arrow{};
+        int TimeWidth = 0;
+        int TitleLeft = 0;
+    };
+
     HWND m_panelWindow = nullptr;
     HWND m_panelList = nullptr;
     HWND m_panelStatus = nullptr;
@@ -141,6 +149,8 @@ private:
     void ShowPanelReservationMenu(size_t rowIndex, POINT screenPoint);
     void ActivatePanelCurrentProgram(size_t rowIndex);
     void DrawPanelWaveButton(const DRAWITEMSTRUCT *draw) const;
+    PanelRowLayout CalculatePanelRowLayout(const RECT &itemRect, HDC dc) const;
+    void ResetPanelMarqueeForLayoutChange();
     void DrawPanelRow(const DRAWITEMSTRUCT *draw) const;
     bool ApplyPanelReservation(const ReservationItem &item, bool record);
     bool RemovePanelReservation(const ReservationItem &item);

@@ -60,23 +60,26 @@ COLORREF MixColor(COLORREF a, COLORREF b, int bPercent) {
 
 struct PanelSemanticTextColors {
     COLORREF Station;
+    COLORREF Time;
     COLORREF CurrentProgram;
     COLORREF FutureProgram;
 };
 
-// パネル文字色の正本。背景の明暗だけで値を切り替え、意味と描画経路は共通にする。
+// パネル文字色。時刻は番組名から独立させ、情報の階層を色でも判別できるようにする。
 PanelSemanticTextColors GetPanelSemanticTextColors(bool darkSurface) {
     if (darkSurface) {
         return {
             RGB(112, 174, 218), // 局名
-            RGB(224, 187, 103), // 現在番組（時刻を含む）
-            RGB(118, 184, 137)  // 未来番組（時刻を含む）
+            RGB(184, 190, 198), // 時刻
+            RGB(224, 187, 103), // 現在番組
+            RGB(118, 184, 137)  // 未来番組
         };
     }
     return {
         RGB(39, 92, 139),   // 局名
-        RGB(132, 91, 28),   // 現在番組（時刻を含む）
-        RGB(53, 112, 70)    // 未来番組（時刻を含む）
+        RGB(82, 88, 96),    // 時刻
+        RGB(132, 91, 28),   // 現在番組
+        RGB(53, 112, 70)    // 未来番組
     };
 }
 
@@ -647,8 +650,15 @@ void CViewReservationPlugin::LayoutPanel(int width, int height) {
     if (gr != nullptr) MoveWindow(gr, margin, margin, waveWidth, waveHeight, TRUE);
     if (bs != nullptr) MoveWindow(bs, margin + waveWidth + gap, margin, waveWidth, waveHeight, TRUE);
     if (cs != nullptr) MoveWindow(cs, margin + (waveWidth + gap) * 2, margin, waveWidth, waveHeight, TRUE);
+
     const int listWidth = (std::max)(20, width - margin * 2);
-    if (m_panelList != nullptr) MoveWindow(m_panelList, margin, listTop, listWidth, listHeight, TRUE);
+    if (m_panelList != nullptr) {
+        ResetPanelMarqueeForLayoutChange();
+        SetWindowPos(m_panelList, nullptr, margin, listTop, listWidth, listHeight,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+        RedrawWindow(m_panelList, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
     if (m_panelStatus != nullptr) {
         const int statusHeight = (std::min)(48, (std::max)(28, listHeight / 5));
         MoveWindow(m_panelStatus, margin, listTop, listWidth, statusHeight, TRUE);
@@ -1113,7 +1123,7 @@ void CViewReservationPlugin::DrawPanelWaveButton(const DRAWITEMSTRUCT *draw) con
     const wchar_t *label = L"";
     if (draw->CtlID == kControlWaveGr) {
         wave = TVTest::TUNINGSPACE_TERRESTRIAL;
-        label = L"GR";
+        label = L"地上波";
     } else if (draw->CtlID == kControlWaveBs) {
         wave = TVTest::TUNINGSPACE_BS;
         label = L"BS";
@@ -1156,6 +1166,73 @@ void CViewReservationPlugin::DrawPanelWaveButton(const DRAWITEMSTRUCT *draw) con
     RECT text = draw->rcItem;
     DrawTextW(dc, label, -1, &text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     if (oldFont != nullptr) SelectObject(dc, oldFont);
+}
+
+CViewReservationPlugin::PanelRowLayout CViewReservationPlugin::CalculatePanelRowLayout(
+    const RECT &itemRect, HDC dc) const {
+    PanelRowLayout layout{};
+
+    // Win32 RECT は LONG、レイアウト定数は int なので、
+    // 以後の計算は最初に int へ正規化して std::min/max の型を一本化する。
+    const int itemLeft = static_cast<int>(itemRect.left);
+    const int itemRight = static_cast<int>(itemRect.right);
+
+    const int rcLeft = itemLeft + 5;
+    const int rcRight = itemRight - 4;
+
+    layout.Content.left = rcLeft;
+    layout.Content.top = itemRect.top;
+    layout.Content.right = (std::max)(
+        rcLeft,
+        rcRight - kPanelArrowVisualWidth - kPanelReservationVisualWidth);
+    layout.Content.bottom = itemRect.bottom;
+
+    layout.Arrow.left = (std::max)(
+        rcLeft,
+        rcRight - kPanelArrowVisualWidth + 1);
+    layout.Arrow.top = itemRect.top;
+    layout.Arrow.right = rcRight;
+    layout.Arrow.bottom = itemRect.bottom;
+
+    layout.Reservation.right = (std::max)(
+        rcLeft,
+        rcRight - kPanelArrowVisualWidth);
+    layout.Reservation.left = (std::max)(
+        rcLeft,
+        static_cast<int>(layout.Reservation.right) - kPanelReservationVisualWidth);
+    layout.Reservation.top = itemRect.top;
+    layout.Reservation.bottom = itemRect.bottom;
+
+    SIZE timeSize{};
+    constexpr wchar_t kTimeSample[] = L"00:00-00:00";
+    int measuredTimeWidth = 0;
+    if (dc != nullptr &&
+        GetTextExtentPoint32W(dc, kTimeSample, 11, &timeSize)) {
+        measuredTimeWidth = static_cast<int>(timeSize.cx);
+    }
+
+    const int desiredTimeWidth = (std::max)(
+        1,
+        measuredTimeWidth + kPanelTimeColumnPadding);
+    const int contentWidth = (std::max)(
+        0,
+        static_cast<int>(layout.Content.right) - static_cast<int>(layout.Content.left));
+    layout.TimeWidth = (std::min)(desiredTimeWidth, contentWidth);
+    layout.TitleLeft = (std::min)(
+        static_cast<int>(layout.Content.right),
+        static_cast<int>(layout.Content.left) + layout.TimeWidth + kPanelTitleGap);
+    return layout;
+}
+
+void CViewReservationPlugin::ResetPanelMarqueeForLayoutChange() {
+    m_panelHoverRow = -1;
+    m_panelMarqueeActive = false;
+    m_panelMouseTracking = false;
+    m_panelMarqueeEpochTick = GetTickMs();
+    if (m_panelWindow != nullptr) {
+        KillTimer(m_panelWindow, kPanelMarqueeTimerId);
+        KillTimer(m_panelWindow, kPanelMarqueeDelayTimerId);
+    }
 }
 
 void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
@@ -1206,14 +1283,9 @@ void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
         oldFont = SelectObject(dc, font);
     }
 
-    RECT rc = draw->rcItem;
-    rc.left += 5;
-    rc.right -= 4;
-    // 右端の予約状態列と展開列は全行で常時予約し、状態や展開前後で本文幅を動かさない。
-    const int arrowWidth = kPanelArrowVisualWidth;
-    const int reservationWidth = kPanelReservationVisualWidth;
-    RECT content = rc;
-    content.right -= arrowWidth + reservationWidth;
+    // 右端の予約状態列・展開列・時刻列を全描画経路で同じ計算に統一する。
+    const PanelRowLayout layout = CalculatePanelRowLayout(draw->rcItem, dc);
+    RECT content = layout.Content;
 
     auto formatTime = [](const ReservationItem &item) {
         if (item.Duration == 0) return std::wstring{};
@@ -1235,9 +1307,8 @@ void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
     TEXTMETRICW tm{};
     GetTextMetricsW(dc, &tm);
     const int lineHeight = (std::max)(14, static_cast<int>(tm.tmHeight));
-    const int contentWidth = (std::max)(0, static_cast<int>(content.right - content.left));
-    const int timeWidth = (std::min)(kPanelTimeColumnWidth, contentWidth);
-    const int titleStart = (std::min)(static_cast<int>(content.right), static_cast<int>(content.left) + timeWidth + kPanelTitleGap);
+    const int timeWidth = layout.TimeWidth;
+    const int titleStart = layout.TitleLeft;
 
     RECT titleRect{};
     if (!row.IsFuture) {
@@ -1253,7 +1324,7 @@ void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
         const std::wstring time = formatTime(row.Program);
         RECT timeRect = second;
         timeRect.right = (std::min)(second.right, second.left + timeWidth);
-        SetTextColor(dc, semantic.CurrentProgram);
+        SetTextColor(dc, semantic.Time);
         DrawTextW(dc, time.c_str(), -1, &timeRect,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
         titleRect = second;
@@ -1265,7 +1336,7 @@ void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
         const std::wstring time = formatTime(row.Program);
         RECT timeRect = content;
         timeRect.right = (std::min)(content.right, timeRect.left + timeWidth);
-        SetTextColor(dc, semantic.FutureProgram);
+        SetTextColor(dc, semantic.Time);
         DrawTextW(dc, time.c_str(), -1, &timeRect,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
         titleRect = content;
@@ -1318,9 +1389,7 @@ void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
     }
 
     if (row.ReservationKind != PanelReservationKind::None) {
-        RECT reservationRect = rc;
-        reservationRect.right = rc.right - arrowWidth;
-        reservationRect.left = reservationRect.right - reservationWidth;
+        RECT reservationRect = layout.Reservation;
         const bool recordReserved = row.ReservationKind == PanelReservationKind::Record;
         const COLORREF reservationColor = darkSurface
             ? (recordReserved ? RGB(255, 105, 105) : RGB(105, 200, 255))
@@ -1333,8 +1402,7 @@ void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
     }
 
     if (!row.IsFuture && row.HasFuture) {
-        RECT arrowRect = rc;
-        arrowRect.left = rc.right - arrowWidth + 1;
+        RECT arrowRect = layout.Arrow;
         const bool expanded = m_panelExpandedChannels.find(row.ChannelKey) != m_panelExpandedChannels.end();
         const COLORREF arrowBack = expanded ? MixColor(accentTop, accentBottom, 50) : MixColor(panelBack, accentTop, 18);
         FillSolid(dc, arrowRect, arrowBack);
@@ -1493,7 +1561,7 @@ LRESULT CALLBACK CViewReservationPlugin::PanelWindowProc(HWND hwnd, UINT message
     switch (message) {
     case WM_CREATE: {
         const DWORD waveStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW;
-        CreateWindowExW(0, L"BUTTON", L"GR", waveStyle | WS_GROUP,
+        CreateWindowExW(0, L"BUTTON", L"地上波", waveStyle | WS_GROUP,
             0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlWaveGr)), g_hinstDLL, nullptr);
         CreateWindowExW(0, L"BUTTON", L"BS", waveStyle,
             0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlWaveBs)), g_hinstDLL, nullptr);
@@ -1632,13 +1700,23 @@ LRESULT CALLBACK CViewReservationPlugin::PanelWindowProc(HWND hwnd, UINT message
                 RECT item{};
                 if (SendMessageW(self->m_panelList, LB_GETITEMRECT,
                     static_cast<WPARAM>(self->m_panelHoverRow), reinterpret_cast<LPARAM>(&item)) != LB_ERR) {
-                    // ホバー中の1行について、タイトル列だけを更新する。
-                    RECT dirty = item;
-                    dirty.left += 5;
-                    dirty.right -= 4 + kPanelArrowVisualWidth;
-                    const int contentWidth = (std::max)(0, static_cast<int>(dirty.right - dirty.left));
-                    const int timeWidth = (std::min)(kPanelTimeColumnWidth, contentWidth);
-                    dirty.left = (std::min)(dirty.right, dirty.left + timeWidth + kPanelTitleGap);
+                    // ホバー中の1行について、通常描画と同じレイアウト計算からタイトル列だけを更新する。
+                    HDC layoutDc = GetDC(self->m_panelList);
+                    HFONT layoutFont = reinterpret_cast<HFONT>(SendMessageW(self->m_panelList, WM_GETFONT, 0, 0));
+                    HGDIOBJ oldLayoutFont = nullptr;
+                    if (layoutDc != nullptr && layoutFont != nullptr) {
+                        oldLayoutFont = SelectObject(layoutDc, layoutFont);
+                    }
+                    const PanelRowLayout layout = self->CalculatePanelRowLayout(item, layoutDc);
+                    if (layoutDc != nullptr && oldLayoutFont != nullptr) {
+                        SelectObject(layoutDc, oldLayoutFont);
+                    }
+                    if (layoutDc != nullptr) {
+                        ReleaseDC(self->m_panelList, layoutDc);
+                    }
+
+                    RECT dirty = layout.Content;
+                    dirty.left = layout.TitleLeft;
                     if (dirty.right > dirty.left) {
                         InvalidateRect(self->m_panelList, &dirty, FALSE);
                     }
@@ -2104,12 +2182,10 @@ void CViewReservationPlugin::RunMaintenanceTick() {
 
         if (IsStartupEpgWaitActive()) {
             if (!m_epgWaitLogged) {
-                Log(L"[視聴予約] EPGロード待機中");
                 m_epgWaitLogged = true;
             }
         } else {
             if (m_epgWaitLogged) {
-                Log(L"[視聴予約] EPGロード待機を終了し予約検証を開始します");
                 m_epgWaitLogged = false;
             }
             ReconcileByEpg();
@@ -2141,7 +2217,7 @@ void CViewReservationPlugin::RunMaintenanceTick() {
             ReleaseTriggerKey(triggerKey);
         }
     } catch (...) {
-        Log(L"[視聴予約] 監視中に例外が発生しました");
+        Log(L"[視聴予約] 予約処理中にエラーが発生しました");
     }
 }
 
@@ -2478,16 +2554,14 @@ void CViewReservationPlugin::ReconcileByEpg() {
         const bool protectNear = secUntil <= 30 * 60;
 
         if (IsStartupEpgWaitActive() || isToday || protectNear) {
-            Log(L"[視聴予約] EPG再探索待ち: " + item.EventName);
             continue;
         }
 
         if (secUntil <= 10 * 60) {
             if (m_manager->RemoveReservation(item.NetworkID, item.TransportStreamID, item.ServiceID, item.EventID)) {
-                Log(L"[視聴予約] EPG上で見つからず、救済にも失敗したため解除: " + item.EventName);
+                Log(L"[視聴予約] 番組表で番組を確認できなかったため予約を解除しました: " + item.EventName);
             }
         } else {
-            Log(L"[視聴予約] EPG再探索待ち: " + item.EventName);
         }
     }
 }
@@ -2571,31 +2645,28 @@ CViewReservationPlugin::ReservationTriggerResult CViewReservationPlugin::TrySwit
         currentChannel.ServiceID == item.ServiceID;
 
     if (onSameService) {
-        Log(prefix + L"同一サービスのためチャンネル切替をスキップ: " + item.EventName);
         return TryStartRecording(item, actionLabel)
             ? ReservationTriggerResult::Completed
             : ReservationTriggerResult::Failed;
     }
 
     if (!BeginPendingRecording(item, actionLabel, triggerKey)) {
-        Log(prefix + L"別の録画開始処理中のため開始できません: " + item.EventName);
+        Log(prefix + L"別の録画予約を処理中のため開始できません: " + item.EventName);
         return ReservationTriggerResult::Failed;
     }
 
     if (TrySelectOnCurrentDriver(item)) {
-        Log(prefix + L"チャンネル切り替え: " + item.EventName);
         m_cv.notify_all();
         return ReservationTriggerResult::Pending;
     }
 
     if (TrySelectByEnumeratingDrivers(item)) {
-        Log(prefix + L"BonDriverを跨いで切り替え: " + item.EventName);
         m_cv.notify_all();
         return ReservationTriggerResult::Pending;
     }
 
     ClearPendingRecording();
-    Log(prefix + L"切り替え失敗: " + item.EventName);
+    Log(prefix + L"チャンネルを切り替えられませんでした: " + item.EventName);
     return ReservationTriggerResult::Failed;
 }
 
@@ -2612,21 +2683,18 @@ bool CViewReservationPlugin::TrySwitchToItem(ReservationItem &item, const wchar_
         currentChannel.ServiceID == item.ServiceID;
 
     if (onSameService) {
-        Log(prefix + L"同一サービスのためチャンネル切替をスキップ: " + item.EventName);
         return true;
     }
 
     if (TrySelectOnCurrentDriver(item)) {
-        Log(prefix + L"チャンネル切り替え: " + item.EventName);
         return true;
     }
 
     if (TrySelectByEnumeratingDrivers(item)) {
-        Log(prefix + L"BonDriverを跨いで切り替え: " + item.EventName);
         return true;
     }
 
-    Log(prefix + L"切り替え失敗: " + item.EventName);
+    Log(prefix + L"チャンネルを切り替えられませんでした: " + item.EventName);
     return false;
 }
 
@@ -2686,7 +2754,7 @@ void CViewReservationPlugin::TryCompletePendingRecording() {
             }
         }
         if (expired) {
-            Log(L"[" + snapshot.Label + L"] チャンネル切替を確認できなかったため録画を開始しません: " + snapshot.Item.EventName);
+            Log(L"[" + snapshot.Label + L"] 予約先のチャンネルへ切り替えられなかったため録画を開始できません: " + snapshot.Item.EventName);
             ReleaseTriggerKey(snapshot.TriggerKey);
         }
         return;
@@ -2769,7 +2837,7 @@ bool CViewReservationPlugin::TryStartRecording(const ReservationItem &item, cons
     }();
 
     if (msUntilEnd == 0) {
-        Log(prefix + L"番組終了済みのため録画開始をスキップ: " + item.EventName);
+        Log(prefix + L"番組が終了しているため録画を開始できません: " + item.EventName);
         return false;
     }
 
@@ -2781,7 +2849,7 @@ bool CViewReservationPlugin::TryStartRecording(const ReservationItem &item, cons
         return true;
     }
 
-    Log(prefix + L"録画開始失敗: " + item.EventName);
+    Log(prefix + L"録画を開始できませんでした: " + item.EventName);
     return false;
 }
 

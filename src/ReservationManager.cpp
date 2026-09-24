@@ -478,7 +478,7 @@ bool ReservationManager::UpdateTimingByIds(
             SaveUnlocked();
             if (message != nullptr) {
                 const wchar_t *prefix = item.RecordOnTrigger ? L"[録画予約]" : L"[視聴予約]";
-                *message = std::wstring(prefix) + L" EPG更新を反映しました: " + item.EventName;
+                *message = std::wstring(prefix) + L" 番組表の更新を予約に反映しました: " + item.EventName;
             }
         }
         return changed;
@@ -518,7 +518,7 @@ bool ReservationManager::ReplaceIdentity(
         SaveUnlocked();
         if (message != nullptr) {
             const wchar_t *prefix = item.RecordOnTrigger ? L"[録画予約]" : L"[視聴予約]";
-            *message = std::wstring(prefix) + L" サービス再探索で予約先を更新しました: " + oldName + L" -> " + item.EventName;
+            *message = std::wstring(prefix) + L" 番組情報の更新により予約先を更新しました: " + oldName + L" -> " + item.EventName;
         }
         return true;
     }
