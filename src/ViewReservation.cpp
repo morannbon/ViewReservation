@@ -628,6 +628,8 @@ void CViewReservationPlugin::DestroyPanelWindow() {
     }
     m_panelRows.clear();
     m_panelExpandedChannels.clear();
+    m_panelWave = PanelWave::Terrestrial;
+    m_panelCatvAvailable = false;
     UnregisterClassW(L"ViewReservation.PanelWindow", g_hinstDLL);
 }
 
@@ -639,17 +641,28 @@ void CViewReservationPlugin::LayoutPanel(int width, int height) {
     constexpr int margin = 4;
     constexpr int gap = 3;
     constexpr int waveHeight = 24;
-    const int waveWidth = (std::max)(34, (width - margin * 2 - gap * 2) / 3);
+    const int waveCount = m_panelCatvAvailable ? 4 : 3;
+    const int totalGap = gap * (waveCount - 1);
+    const int waveWidth = (std::max)(34, (width - margin * 2 - totalGap) / waveCount);
     const int listTop = margin + waveHeight + gap;
     const int listHeight = (std::max)(20, height - listTop - margin);
 
     HWND gr = GetDlgItem(m_panelWindow, kControlWaveGr);
     HWND bs = GetDlgItem(m_panelWindow, kControlWaveBs);
     HWND cs = GetDlgItem(m_panelWindow, kControlWaveCs);
+    HWND catv = GetDlgItem(m_panelWindow, kControlWaveCatv);
 
     if (gr != nullptr) MoveWindow(gr, margin, margin, waveWidth, waveHeight, TRUE);
     if (bs != nullptr) MoveWindow(bs, margin + waveWidth + gap, margin, waveWidth, waveHeight, TRUE);
     if (cs != nullptr) MoveWindow(cs, margin + (waveWidth + gap) * 2, margin, waveWidth, waveHeight, TRUE);
+    if (catv != nullptr) {
+        if (m_panelCatvAvailable) {
+            MoveWindow(catv, margin + (waveWidth + gap) * 3, margin, waveWidth, waveHeight, TRUE);
+            ShowWindow(catv, SW_SHOWNOACTIVATE);
+        } else {
+            ShowWindow(catv, SW_HIDE);
+        }
+    }
 
     const int listWidth = (std::max)(20, width - margin * 2);
     if (m_panelList != nullptr) {
@@ -678,7 +691,7 @@ void CViewReservationPlugin::UpdatePanelFont() {
     }
 
     HFONT applyFont = nextFont != nullptr ? nextFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    for (const int id : { kControlWaveGr, kControlWaveBs, kControlWaveCs, kControlList, kControlStatus }) {
+    for (const int id : { kControlWaveGr, kControlWaveBs, kControlWaveCs, kControlWaveCatv, kControlList, kControlStatus }) {
         HWND control = GetDlgItem(m_panelWindow, id);
         if (control != nullptr) {
             SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(applyFont), TRUE);
@@ -800,15 +813,34 @@ void CViewReservationPlugin::RefreshPanelRows(bool forceDriverCache) {
     m_driverCache.RebuildIfNeeded(m_pApp, forceDriverCache);
     auto channels = m_driverCache.Snapshot();
 
-    auto normalizeSpace = [](const DriverChannelEntry &entry) -> TVTest::TuningSpaceType {
-        if (entry.SpaceType != TVTest::TUNINGSPACE_UNKNOWN) {
-            return entry.SpaceType;
+    auto normalizeSpace = [](const DriverChannelEntry &entry) -> PanelWave {
+        if (entry.IsCatv) {
+            return PanelWave::Catv;
         }
-        if (entry.NetworkID == 4) return TVTest::TUNINGSPACE_BS;
-        if (entry.NetworkID == 6 || entry.NetworkID == 7) return TVTest::TUNINGSPACE_110CS;
-        if ((entry.NetworkID & 0xF000U) == 0x7000U) return TVTest::TUNINGSPACE_TERRESTRIAL;
-        return TVTest::TUNINGSPACE_UNKNOWN;
+        if (entry.SpaceType == TVTest::TUNINGSPACE_BS || entry.NetworkID == 4) {
+            return PanelWave::Bs;
+        }
+        if (entry.SpaceType == TVTest::TUNINGSPACE_110CS || entry.NetworkID == 6 || entry.NetworkID == 7) {
+            return PanelWave::Cs;
+        }
+        return PanelWave::Terrestrial;
     };
+
+    const bool catvAvailable = std::any_of(channels.begin(), channels.end(), [](const DriverChannelEntry &entry) {
+        return entry.IsCatv;
+    });
+    if (catvAvailable != m_panelCatvAvailable) {
+        m_panelCatvAvailable = catvAvailable;
+        if (!m_panelCatvAvailable && m_panelWave == PanelWave::Catv) {
+            m_panelWave = PanelWave::Terrestrial;
+        }
+        if (m_panelWindow != nullptr) {
+            RECT panelRect{};
+            GetClientRect(m_panelWindow, &panelRect);
+            LayoutPanel(static_cast<int>(panelRect.right - panelRect.left),
+                static_cast<int>(panelRect.bottom - panelRect.top));
+        }
+    }
 
     // Preserve the channel order returned by TVTest / the BonDriver tuning-space list.
     // The panel must not impose its own station-name or service-ID ordering.
@@ -829,8 +861,8 @@ void CViewReservationPlugin::RefreshPanelRows(bool forceDriverCache) {
 
     std::vector<PanelRow> rows;
     for (auto channel : channels) {
-        channel.SpaceType = normalizeSpace(channel);
-        if (channel.SpaceType != m_panelWave) {
+        const PanelWave channelWave = normalizeSpace(channel);
+        if (channelWave != m_panelWave) {
             continue;
         }
 
@@ -952,7 +984,7 @@ void CViewReservationPlugin::RefreshPanelRows(bool forceDriverCache) {
     }
 }
 
-void CViewReservationPlugin::SetPanelWave(TVTest::TuningSpaceType wave) {
+void CViewReservationPlugin::SetPanelWave(PanelWave wave) {
     if (wave == m_panelWave) {
         return;
     }
@@ -965,7 +997,7 @@ void CViewReservationPlugin::SetPanelWave(TVTest::TuningSpaceType wave) {
         KillTimer(m_panelWindow, kPanelMarqueeDelayTimerId);
     }
     m_panelMarqueeEpochTick = GetTickMs();
-    for (const int id : { kControlWaveGr, kControlWaveBs, kControlWaveCs }) {
+    for (const int id : { kControlWaveGr, kControlWaveBs, kControlWaveCs, kControlWaveCatv }) {
         HWND button = m_panelWindow != nullptr ? GetDlgItem(m_panelWindow, id) : nullptr;
         if (button != nullptr) InvalidateRect(button, nullptr, FALSE);
     }
@@ -1119,17 +1151,20 @@ void CViewReservationPlugin::DrawPanelWaveButton(const DRAWITEMSTRUCT *draw) con
     BufferedPaintSurface surface(draw->hDC, paintRect);
     HDC dc = surface.Get();
 
-    TVTest::TuningSpaceType wave = TVTest::TUNINGSPACE_UNKNOWN;
+    PanelWave wave = PanelWave::Terrestrial;
     const wchar_t *label = L"";
     if (draw->CtlID == kControlWaveGr) {
-        wave = TVTest::TUNINGSPACE_TERRESTRIAL;
+        wave = PanelWave::Terrestrial;
         label = L"地上波";
     } else if (draw->CtlID == kControlWaveBs) {
-        wave = TVTest::TUNINGSPACE_BS;
+        wave = PanelWave::Bs;
         label = L"BS";
     } else if (draw->CtlID == kControlWaveCs) {
-        wave = TVTest::TUNINGSPACE_110CS;
+        wave = PanelWave::Cs;
         label = L"CS";
+    } else if (draw->CtlID == kControlWaveCatv) {
+        wave = PanelWave::Catv;
+        label = L"CATV";
     } else {
         return;
     }
@@ -1567,6 +1602,10 @@ LRESULT CALLBACK CViewReservationPlugin::PanelWindowProc(HWND hwnd, UINT message
             0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlWaveBs)), g_hinstDLL, nullptr);
         CreateWindowExW(0, L"BUTTON", L"CS", waveStyle,
             0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlWaveCs)), g_hinstDLL, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"CATV", waveStyle,
+            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlWaveCatv)), g_hinstDLL, nullptr);
+        HWND catvButton = GetDlgItem(hwnd, kControlWaveCatv);
+        if (catvButton != nullptr) ShowWindow(catvButton, SW_HIDE);
 
         self->m_panelList = CreateWindowExW(0, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT |
@@ -1661,7 +1700,7 @@ LRESULT CALLBACK CViewReservationPlugin::PanelWindowProc(HWND hwnd, UINT message
             self->DrawPanelRow(draw);
             return TRUE;
         }
-        if (draw != nullptr && (draw->CtlID == kControlWaveGr || draw->CtlID == kControlWaveBs || draw->CtlID == kControlWaveCs)) {
+        if (draw != nullptr && (draw->CtlID == kControlWaveGr || draw->CtlID == kControlWaveBs || draw->CtlID == kControlWaveCs || draw->CtlID == kControlWaveCatv)) {
             self->DrawPanelWaveButton(draw);
             return TRUE;
         }
@@ -1743,15 +1782,19 @@ LRESULT CALLBACK CViewReservationPlugin::PanelWindowProc(HWND hwnd, UINT message
         const int id = LOWORD(wParam);
         const int notify = HIWORD(wParam);
         if (id == kControlWaveGr && notify == BN_CLICKED) {
-            self->SetPanelWave(TVTest::TUNINGSPACE_TERRESTRIAL);
+            self->SetPanelWave(PanelWave::Terrestrial);
             return 0;
         }
         if (id == kControlWaveBs && notify == BN_CLICKED) {
-            self->SetPanelWave(TVTest::TUNINGSPACE_BS);
+            self->SetPanelWave(PanelWave::Bs);
             return 0;
         }
         if (id == kControlWaveCs && notify == BN_CLICKED) {
-            self->SetPanelWave(TVTest::TUNINGSPACE_110CS);
+            self->SetPanelWave(PanelWave::Cs);
+            return 0;
+        }
+        if (id == kControlWaveCatv && notify == BN_CLICKED && self->m_panelCatvAvailable) {
+            self->SetPanelWave(PanelWave::Catv);
             return 0;
         }
         break;
@@ -2566,7 +2609,23 @@ void CViewReservationPlugin::ReconcileByEpg() {
     }
 }
 
+bool CViewReservationPlugin::IsCurrentDriverPreferred(const ReservationItem &item) const {
+    if (item.LastDriverName.empty() || m_pApp == nullptr) {
+        return true;
+    }
+
+    wchar_t currentDriver[MAX_PATH]{};
+    if (m_pApp->GetDriverName(currentDriver, MAX_PATH) <= 0) {
+        return true;
+    }
+    return _wcsicmp(currentDriver, item.LastDriverName.c_str()) == 0;
+}
+
 bool CViewReservationPlugin::TrySelectOnCurrentDriver(const ReservationItem &item) {
+    if (!IsCurrentDriverPreferred(item)) {
+        return false;
+    }
+
     TVTest::ChannelSelectInfo info{};
     info.Size = sizeof(info);
     info.Flags = static_cast<TVTest::ChannelSelectFlag>(
@@ -2585,9 +2644,18 @@ bool CViewReservationPlugin::TrySelectByEnumeratingDrivers(ReservationItem &item
     m_driverCache.RebuildIfNeeded(m_pApp, false);
 
     DriverChannelEntry found{};
-    if (!m_driverCache.FindExact(item.NetworkID, item.TransportStreamID, item.ServiceID, &found)) {
+    auto findTarget = [&]() {
+        if (!item.LastDriverName.empty() &&
+            m_driverCache.FindExactOnDriver(
+                item.NetworkID, item.TransportStreamID, item.ServiceID, item.LastDriverName, &found)) {
+            return true;
+        }
+        return m_driverCache.FindExact(item.NetworkID, item.TransportStreamID, item.ServiceID, &found);
+    };
+
+    if (!findTarget()) {
         m_driverCache.RebuildIfNeeded(m_pApp, true);
-        if (!m_driverCache.FindExact(item.NetworkID, item.TransportStreamID, item.ServiceID, &found)) {
+        if (!findTarget()) {
             return false;
         }
     }
@@ -2640,6 +2708,7 @@ CViewReservationPlugin::ReservationTriggerResult CViewReservationPlugin::TrySwit
     currentChannel.Size = sizeof(currentChannel);
     const bool onSameService =
         m_pApp->GetCurrentChannelInfo(&currentChannel) &&
+        IsCurrentDriverPreferred(item) &&
         currentChannel.NetworkID == item.NetworkID &&
         currentChannel.TransportStreamID == item.TransportStreamID &&
         currentChannel.ServiceID == item.ServiceID;
@@ -2678,6 +2747,7 @@ bool CViewReservationPlugin::TrySwitchToItem(ReservationItem &item, const wchar_
     currentChannel.Size = sizeof(currentChannel);
     const bool onSameService =
         m_pApp->GetCurrentChannelInfo(&currentChannel) &&
+        IsCurrentDriverPreferred(item) &&
         currentChannel.NetworkID == item.NetworkID &&
         currentChannel.TransportStreamID == item.TransportStreamID &&
         currentChannel.ServiceID == item.ServiceID;

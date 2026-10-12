@@ -16,6 +16,8 @@ struct DriverChannelEntry {
     WORD TransportStreamID = 0;
     WORD ServiceID = 0;
     TVTest::TuningSpaceType SpaceType = TVTest::TUNINGSPACE_UNKNOWN;
+    std::wstring SpaceName;
+    bool IsCatv = false;
     std::wstring ChannelName;
 };
 
@@ -24,6 +26,7 @@ public:
     void Invalidate();
     void RebuildIfNeeded(TVTest::CTVTestApp *app, bool force);
     bool FindExact(WORD nid, WORD tsid, WORD sid, DriverChannelEntry *out) const;
+    bool FindExactOnDriver(WORD nid, WORD tsid, WORD sid, const std::wstring &driverName, DriverChannelEntry *out) const;
     std::vector<DriverChannelEntry> FindByNetwork(WORD nid) const;
     std::vector<DriverChannelEntry> Snapshot() const;
 

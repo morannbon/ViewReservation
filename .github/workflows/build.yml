@@ -1,24 +1,32 @@
-name: build
-
+name: ViewReservation Build
 on:
   push:
   pull_request:
   workflow_dispatch:
-
+permissions:
+  contents: read
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
     strategy:
+      fail-fast: false
       matrix:
         platform: [x64, Win32]
-        configuration: [Release]
     steps:
       - uses: actions/checkout@v4
       - uses: microsoft/setup-msbuild@v2
-      - name: Build
-        run: msbuild ViewReservation.sln /m /p:Configuration=${{ matrix.configuration }} /p:Platform=${{ matrix.platform }}
-      - name: Upload artifact
+      - name: Build with zero warnings
+        shell: pwsh
+        run: |
+          msbuild ViewReservation.sln /t:Rebuild /m /nr:false /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:PreferredToolArchitecture=x64 /p:TreatWarningAsError=true /warnaserror
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed or produced warnings' }
+      - name: Prepare binary package
+        shell: pwsh
+        run: |
+          & ./.github/scripts/package.ps1 -Platform '${{ matrix.platform }}' -RefName '${{ github.ref_name }}'
+      - name: Upload binary package
         uses: actions/upload-artifact@v4
         with:
-          name: ViewReservation-${{ matrix.platform }}-${{ matrix.configuration }}
-          path: bin\${{ matrix.platform }}\${{ matrix.configuration }}\ViewReservation.tvtp
+          name: ViewReservation-${{ matrix.platform }}-package
+          path: package/*.zip
+          if-no-files-found: error

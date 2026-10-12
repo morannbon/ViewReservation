@@ -67,8 +67,9 @@ private:
     static constexpr int kControlWaveGr = 1001;
     static constexpr int kControlWaveBs = 1002;
     static constexpr int kControlWaveCs = 1003;
-    static constexpr int kControlList = 1004;
-    static constexpr int kControlStatus = 1005;
+    static constexpr int kControlWaveCatv = 1004;
+    static constexpr int kControlList = 1005;
+    static constexpr int kControlStatus = 1006;
 
     std::atomic<bool> m_stop{ false };
     std::thread m_worker;
@@ -96,6 +97,7 @@ private:
     PendingRecordRequest m_pendingRecord;
 
     enum class PanelReservationKind { None, View, Record };
+    enum class PanelWave { Terrestrial, Bs, Cs, Catv };
 
     struct PanelRow {
         DriverChannelEntry Channel;
@@ -124,7 +126,8 @@ private:
     COLORREF m_panelBackBrushColor = CLR_INVALID;
     HFONT m_panelFont = nullptr;
     WNDPROC m_panelListOriginalProc = nullptr;
-    TVTest::TuningSpaceType m_panelWave = TVTest::TUNINGSPACE_TERRESTRIAL;
+    PanelWave m_panelWave = PanelWave::Terrestrial;
+    bool m_panelCatvAvailable = false;
     std::vector<PanelRow> m_panelRows;
     std::set<ULONGLONG> m_panelExpandedChannels;
     ULONGLONG m_panelMarqueeEpochTick = 0;
@@ -144,7 +147,7 @@ private:
     void UpdatePanelFont();
     void RefreshPanelRows(bool forceDriverCache);
     bool BuildPanelPrograms(const DriverChannelEntry &channel, ReservationItem *current, std::vector<ReservationItem> *future) const;
-    void SetPanelWave(TVTest::TuningSpaceType wave);
+    void SetPanelWave(PanelWave wave);
     void TogglePanelChannelExpanded(size_t rowIndex);
     void ShowPanelReservationMenu(size_t rowIndex, POINT screenPoint);
     void ActivatePanelCurrentProgram(size_t rowIndex);
@@ -173,6 +176,7 @@ private:
     enum class ReservationTriggerResult { Failed, WaitingForRecording, Completed, Pending };
     ReservationTriggerResult TrySwitchReservation(ReservationItem &item, const std::wstring &triggerKey);
     bool TrySwitchToItem(ReservationItem &item, const wchar_t *actionLabel);
+    bool IsCurrentDriverPreferred(const ReservationItem &item) const;
     bool TrySelectOnCurrentDriver(const ReservationItem &item);
     bool TrySelectByEnumeratingDrivers(ReservationItem &item);
     bool TryStartRecording(const ReservationItem &item, const wchar_t *actionLabel);
