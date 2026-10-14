@@ -814,20 +814,16 @@ void CViewReservationPlugin::RefreshPanelRows(bool forceDriverCache) {
     auto channels = m_driverCache.Snapshot();
 
     auto normalizeSpace = [](const DriverChannelEntry &entry) -> PanelWave {
-        if (entry.IsCatv) {
-            return PanelWave::Catv;
+        switch (ResolveChannelDisplayWave(entry)) {
+        case ChannelDisplayWave::Bs: return PanelWave::Bs;
+        case ChannelDisplayWave::Cs: return PanelWave::Cs;
+        case ChannelDisplayWave::Catv: return PanelWave::Catv;
+        default: return PanelWave::Terrestrial;
         }
-        if (entry.SpaceType == TVTest::TUNINGSPACE_BS || entry.NetworkID == 4) {
-            return PanelWave::Bs;
-        }
-        if (entry.SpaceType == TVTest::TUNINGSPACE_110CS || entry.NetworkID == 6 || entry.NetworkID == 7) {
-            return PanelWave::Cs;
-        }
-        return PanelWave::Terrestrial;
     };
 
     const bool catvAvailable = std::any_of(channels.begin(), channels.end(), [](const DriverChannelEntry &entry) {
-        return entry.IsCatv;
+        return ResolveChannelDisplayWave(entry) == ChannelDisplayWave::Catv;
     });
     if (catvAvailable != m_panelCatvAvailable) {
         m_panelCatvAvailable = catvAvailable;
@@ -1892,7 +1888,7 @@ int CViewReservationPlugin::OnProgramGuideProgramInitializeMenu(
         return 0;
     }
 
-    // 予約状態を取得（EPG救済でIDが変わっている場合はOriginalIDでも照合）
+    // 予約状態を取得（番組情報更新でIDが変わっている場合はOriginalIDでも照合）
     bool isReserved = false;
     bool isRecord = false;
     {
@@ -1985,7 +1981,7 @@ bool CViewReservationPlugin::OnProgramGuideProgramMenuSelected(
     std::wstring message;
 
     // 同じ種別の予約が既にあれば解除、なければ登録
-    // EventIDはEPG救済で変わる場合があるためOriginalIDも照合し、
+    // EventIDは番組情報更新で変わる場合があるためOriginalIDも照合し、
     // 削除時はDB上の実際のIDを使う
     bool foundInDb = false;
     {

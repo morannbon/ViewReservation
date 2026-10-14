@@ -1,42 +1,5 @@
 ﻿#include "DriverCache.h"
 
-#include <algorithm>
-#include <cwctype>
-
-namespace {
-
-std::wstring UpperAsciiLike(std::wstring text) {
-    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch) {
-        return static_cast<wchar_t>(std::towupper(ch));
-    });
-    return text;
-}
-
-bool IsCatvTuningSpaceName(const wchar_t *name) {
-    if (name == nullptr || *name == L'\0') {
-        return false;
-    }
-
-    const std::wstring upper = UpperAsciiLike(name);
-    static constexpr const wchar_t *markers[] = {
-        L"ISDB-C",
-        L"ISDBC",
-        L"CATV",
-        L"CABLE",
-        L"TRANSMODULATION",
-        L"TRANSMOD",
-        L"ケーブル"
-    };
-    for (const wchar_t *marker : markers) {
-        if (upper.find(marker) != std::wstring::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
-} // namespace
-
 void DriverCache::Invalidate() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_valid = false;
@@ -91,7 +54,6 @@ void DriverCache::RebuildIfNeeded(TVTest::CTVTestApp *app, bool force) {
                 entry.SpaceType = space->pInfo != nullptr ? space->pInfo->Space : TVTest::TUNINGSPACE_UNKNOWN;
                 if (space->pInfo != nullptr) {
                     entry.SpaceName = space->pInfo->szName;
-                    entry.IsCatv = IsCatvTuningSpaceName(space->pInfo->szName);
                 }
                 entry.ChannelName = ch->szChannelName;
                 entries.push_back(entry);

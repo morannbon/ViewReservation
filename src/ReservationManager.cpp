@@ -40,7 +40,7 @@ ReservationManager::ReservationManager(std::wstring iniPath)
 bool ReservationManager::SameIdentity(const ReservationItem &a, WORD nid, WORD tsid, WORD sid, WORD eid) {
     if (a.NetworkID == nid && a.TransportStreamID == tsid && a.ServiceID == sid && a.EventID == eid)
         return true;
-    // EPG救済でIDが変わっている場合はOriginalIDでも照合
+    // 番組情報更新でIDが変わっている場合はOriginalIDでも照合
     return a.OriginalNetworkID == nid && a.OriginalTransportStreamID == tsid &&
            a.OriginalServiceID == sid && a.OriginalEventID == eid;
 }
