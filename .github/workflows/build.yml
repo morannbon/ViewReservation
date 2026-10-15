@@ -20,6 +20,9 @@ jobs:
         run: |
           msbuild ViewReservation.sln /t:Rebuild /m /nr:false /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:PreferredToolArchitecture=x64 /p:TreatWarningAsError=true /warnaserror
           if ($LASTEXITCODE -ne 0) { throw 'Release build failed or produced warnings' }
+      - name: Verify channel classification and exact TVTest exports
+        shell: cmd
+        run: .github\scripts\test.cmd ${{ matrix.platform }}
       - name: Prepare binary package
         shell: pwsh
         run: |
@@ -30,3 +33,4 @@ jobs:
           name: ViewReservation-${{ matrix.platform }}-package
           path: package/*.zip
           if-no-files-found: error
+

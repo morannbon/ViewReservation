@@ -1,0 +1,5 @@
+EXPORTS
+    TVTGetVersion=_TVTGetVersion@0
+    TVTGetPluginInfo=_TVTGetPluginInfo@4
+    TVTInitialize=_TVTInitialize@4
+    TVTFinalize=_TVTFinalize@0

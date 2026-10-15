@@ -105,6 +105,14 @@
   <ItemGroup>
     <None Include="README.txt" />
   </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(Platform)'=='Win32'">
+    <Link>
+      <ModuleDefinitionFile>$(ProjectDir)src\ViewReservation.x86.def</ModuleDefinitionFile>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <None Include="src\ViewReservation.x86.def" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>
