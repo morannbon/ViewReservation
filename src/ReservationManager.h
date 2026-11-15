@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include <windows.h>
+#include <cstddef>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -64,12 +65,11 @@ private:
     static bool SameIdentity(const ReservationItem &a, WORD nid, WORD tsid, WORD sid, WORD eid);
     static bool SameStart(const ReservationItem &a, const ReservationItem &b);
     static bool SameProgramSlot(const ReservationItem &a, const ReservationItem &b);
-    static ULONGLONG ToFileTimeValue(const SYSTEMTIME &st);
     static std::wstring FormatDateTime(const SYSTEMTIME &st);
     static std::wstring FormatTimeRange(const ReservationItem &item);
     static bool TimeRangesOverlap(const ReservationItem &a, const ReservationItem &b);
     static bool ParseDateTime(const std::wstring &text, SYSTEMTIME *st);
 
     void SaveUnlocked() const;
-    void RemoveExpiredUnlocked();
+    bool RemoveExpiredUnlocked();
 };

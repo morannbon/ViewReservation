@@ -13,7 +13,7 @@ void DriverCache::RebuildIfNeeded(TVTest::CTVTestApp *app, bool force) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
     const auto now = std::chrono::steady_clock::now();
-    if (!force && m_valid && (now - m_lastBuild) < std::chrono::minutes(30)) {
+    if (!force && m_valid && (now - m_lastBuild) < std::chrono::minutes(1)) {
         return;
     }
 
@@ -52,6 +52,7 @@ void DriverCache::RebuildIfNeeded(TVTest::CTVTestApp *app, bool force) {
                 entry.TransportStreamID = ch->TransportStreamID;
                 entry.ServiceID = ch->ServiceID;
                 entry.SpaceType = space->pInfo != nullptr ? space->pInfo->Space : TVTest::TUNINGSPACE_UNKNOWN;
+                entry.Flags = ch->Flags;
                 if (space->pInfo != nullptr) {
                     entry.SpaceName = space->pInfo->szName;
                 }
@@ -113,4 +114,9 @@ std::vector<DriverChannelEntry> DriverCache::FindByNetwork(WORD nid) const {
 std::vector<DriverChannelEntry> DriverCache::Snapshot() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_entries;
+}
+
+std::vector<DriverChannelEntry> DriverCache::SnapshotDisplayServices() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return BuildEnabledDisplayServices(m_entries);
 }

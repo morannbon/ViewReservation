@@ -5,6 +5,7 @@
 #include <vector>
 #include <chrono>
 #include <mutex>
+#include <set>
 
 #include "TVTestPlugin.h"
 
@@ -16,15 +17,41 @@ struct DriverChannelEntry {
     WORD TransportStreamID = 0;
     WORD ServiceID = 0;
     TVTest::TuningSpaceType SpaceType = TVTest::TUNINGSPACE_UNKNOWN;
+    TVTest::ChannelFlag Flags = TVTest::CHANNEL_FLAG_NONE;
     std::wstring SpaceName;
     std::wstring ChannelName;
 };
 
 enum class ChannelDisplayWave { Terrestrial, Bs, Cs, Catv };
 
-// Display classification only; DriverName/Space/Channel remain the tuning route.
-// Unknown nonzero networks use the CATV display bucket, not a claim that a
-// particular driver or tuning space implements cable reception.
+inline ULONGLONG MakeChannelServiceKey(const DriverChannelEntry &entry) {
+    return (static_cast<ULONGLONG>(entry.NetworkID) << 32) |
+        (static_cast<ULONGLONG>(entry.TransportStreamID) << 16) |
+        static_cast<ULONGLONG>(entry.ServiceID);
+}
+
+inline bool IsChannelEnabledForDisplay(const DriverChannelEntry &entry) {
+    return (static_cast<DWORD>(entry.Flags) & static_cast<DWORD>(TVTest::CHANNEL_FLAG_DISABLED)) == 0;
+}
+
+inline std::vector<DriverChannelEntry> BuildEnabledDisplayServices(const std::vector<DriverChannelEntry> &entries) {
+    std::vector<DriverChannelEntry> result;
+    std::set<ULONGLONG> seen;
+    result.reserve(entries.size());
+    for (const auto &entry : entries) {
+        if (!IsChannelEnabledForDisplay(entry)) {
+            continue;
+        }
+        const ULONGLONG key = MakeChannelServiceKey(entry);
+        if (!seen.insert(key).second) {
+            continue;
+        }
+        result.push_back(entry);
+    }
+    return result;
+}
+
+// 表示分類と選局経路は分離する。DriverName / Space / Channel は選局経路として保持する。
 inline ChannelDisplayWave ResolveChannelDisplayWave(const DriverChannelEntry &entry) {
     if (entry.NetworkID == 4) return ChannelDisplayWave::Bs;
     if (entry.NetworkID == 6 || entry.NetworkID == 7 || entry.NetworkID == 10)
@@ -33,7 +60,7 @@ inline ChannelDisplayWave ResolveChannelDisplayWave(const DriverChannelEntry &en
         return ChannelDisplayWave::Terrestrial;
     if (entry.NetworkID != 0) return ChannelDisplayWave::Catv;
 
-    // No network identity yet: retain TVTest's explicit legacy space type.
+    // NetworkID未確定時はTVTestが返したチューニング空間種別を使う。
     if (entry.SpaceType == TVTest::TUNINGSPACE_BS) return ChannelDisplayWave::Bs;
     if (entry.SpaceType == TVTest::TUNINGSPACE_110CS) return ChannelDisplayWave::Cs;
     return ChannelDisplayWave::Terrestrial;
@@ -47,6 +74,7 @@ public:
     bool FindExactOnDriver(WORD nid, WORD tsid, WORD sid, const std::wstring &driverName, DriverChannelEntry *out) const;
     std::vector<DriverChannelEntry> FindByNetwork(WORD nid) const;
     std::vector<DriverChannelEntry> Snapshot() const;
+    std::vector<DriverChannelEntry> SnapshotDisplayServices() const;
 
 private:
     mutable std::mutex m_mutex;

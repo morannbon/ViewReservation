@@ -1,32 +1,34 @@
 ﻿#include "ReservationManager.h"
+#include "ReservationTime.h"
 
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
 #include <array>
 #include <iterator>
+#include <utility>
 
 namespace {
 constexpr wchar_t kSectionSettings[] = L"Settings";
 constexpr wchar_t kKeyCount[] = L"Count";
 
-static int ReadInt(LPCWSTR section, LPCWSTR key, int defValue, const std::wstring &path) {
+int ReadInt(LPCWSTR section, LPCWSTR key, int defValue, const std::wstring &path) {
     return GetPrivateProfileIntW(section, key, defValue, path.c_str());
 }
 
-static void WriteUInt(const std::wstring &path, LPCWSTR section, LPCWSTR key, UINT value) {
+void WriteUInt(const std::wstring &path, LPCWSTR section, LPCWSTR key, UINT value) {
     wchar_t text[32]{};
     swprintf_s(text, L"%u", value);
     WritePrivateProfileStringW(section, key, text, path.c_str());
 }
 
-static void WriteInt(const std::wstring &path, LPCWSTR section, LPCWSTR key, int value) {
+void WriteInt(const std::wstring &path, LPCWSTR section, LPCWSTR key, int value) {
     wchar_t text[32]{};
     swprintf_s(text, L"%d", value);
     WritePrivateProfileStringW(section, key, text, path.c_str());
 }
 
-static std::wstring ReservationSection(UINT index) {
+std::wstring ReservationSection(UINT index) {
     std::array<wchar_t, 32> section{};
     swprintf_s(section.data(), section.size(), L"Reservation%u", index);
     return section.data();
@@ -46,20 +48,11 @@ bool ReservationManager::SameIdentity(const ReservationItem &a, WORD nid, WORD t
 }
 
 bool ReservationManager::SameStart(const ReservationItem &a, const ReservationItem &b) {
-    return ToFileTimeValue(a.StartTime) == ToFileTimeValue(b.StartTime);
+    return ViewReservationTime::FileTimeValue(a.StartTime) == ViewReservationTime::FileTimeValue(b.StartTime);
 }
 
 bool ReservationManager::SameProgramSlot(const ReservationItem &a, const ReservationItem &b) {
     return SameStart(a, b) && !a.EventName.empty() && a.EventName == b.EventName;
-}
-
-ULONGLONG ReservationManager::ToFileTimeValue(const SYSTEMTIME &st) {
-    FILETIME ft{};
-    SystemTimeToFileTime(&st, &ft);
-    ULARGE_INTEGER ui{};
-    ui.LowPart = ft.dwLowDateTime;
-    ui.HighPart = ft.dwHighDateTime;
-    return ui.QuadPart;
 }
 
 std::wstring ReservationManager::FormatDateTime(const SYSTEMTIME &st) {
@@ -81,7 +74,7 @@ std::wstring ReservationManager::FormatTimeRange(const ReservationItem &item) {
         ULARGE_INTEGER value{};
         value.LowPart = startFileTime.dwLowDateTime;
         value.HighPart = startFileTime.dwHighDateTime;
-        value.QuadPart += static_cast<ULONGLONG>(item.Duration) * 10000000ULL;
+        value.QuadPart += static_cast<ULONGLONG>(item.Duration) * ViewReservationTime::TicksPerSecond;
         FILETIME endFileTime{};
         endFileTime.dwLowDateTime = value.LowPart;
         endFileTime.dwHighDateTime = value.HighPart;
@@ -97,10 +90,10 @@ std::wstring ReservationManager::FormatTimeRange(const ReservationItem &item) {
 }
 
 bool ReservationManager::TimeRangesOverlap(const ReservationItem &a, const ReservationItem &b) {
-    const ULONGLONG aStart = ToFileTimeValue(a.StartTime);
-    const ULONGLONG bStart = ToFileTimeValue(b.StartTime);
-    const ULONGLONG aEnd = aStart + static_cast<ULONGLONG>(a.Duration) * 10000000ULL;
-    const ULONGLONG bEnd = bStart + static_cast<ULONGLONG>(b.Duration) * 10000000ULL;
+    const ULONGLONG aStart = ViewReservationTime::FileTimeValue(a.StartTime);
+    const ULONGLONG bStart = ViewReservationTime::FileTimeValue(b.StartTime);
+    const ULONGLONG aEnd = aStart + static_cast<ULONGLONG>(a.Duration) * ViewReservationTime::TicksPerSecond;
+    const ULONGLONG bEnd = bStart + static_cast<ULONGLONG>(b.Duration) * ViewReservationTime::TicksPerSecond;
     return aStart < bEnd && bStart < aEnd;
 }
 
@@ -126,10 +119,8 @@ void ReservationManager::Load() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_items.clear();
 
-    const UINT declaredCount = static_cast<UINT>(ReadInt(kSectionSettings, kKeyCount, 0, m_iniPath));
-    const UINT scanCount = (std::max)(declaredCount, static_cast<UINT>(kMaxReservations));
-
-    for (UINT i = 0; i < scanCount && i < kMaxReservations; ++i) {
+    // Only the defined reservation slots are valid, regardless of Count in the INI.
+    for (UINT i = 0; i < static_cast<UINT>(kMaxReservations); ++i) {
         const std::wstring section = ReservationSection(i);
 
         wchar_t startText[512]{};
@@ -170,14 +161,14 @@ void ReservationManager::Load() {
 
         const bool exactDuplicate = std::any_of(m_items.begin(), m_items.end(), [&](const ReservationItem &existing) {
             return SameIdentity(existing, item.NetworkID, item.TransportStreamID, item.ServiceID, item.EventID) &&
-                   ToFileTimeValue(existing.StartTime) == ToFileTimeValue(item.StartTime);
+                   ViewReservationTime::FileTimeValue(existing.StartTime) == ViewReservationTime::FileTimeValue(item.StartTime);
         });
         if (exactDuplicate) {
             continue;
         }
 
         const auto sameStartIt = std::find_if(m_items.begin(), m_items.end(), [&](const ReservationItem &existing) {
-            return ToFileTimeValue(existing.StartTime) == ToFileTimeValue(item.StartTime);
+            return ViewReservationTime::FileTimeValue(existing.StartTime) == ViewReservationTime::FileTimeValue(item.StartTime);
         });
         if (sameStartIt != m_items.end()) {
             *sameStartIt = item;
@@ -199,10 +190,9 @@ void ReservationManager::Save() {
 }
 
 void ReservationManager::SaveUnlocked() const {
-    const UINT oldCount = GetPrivateProfileIntW(kSectionSettings, kKeyCount, 0, m_iniPath.c_str());
-    const UINT cleanupCount = (std::max)(oldCount, static_cast<UINT>(kMaxReservations));
-
-    for (UINT i = 0; i < cleanupCount; ++i) {
+    // The storage has exactly kMaxReservations slots. An invalid Count must
+    // not cause an unbounded number of INI section deletions.
+    for (UINT i = 0; i < static_cast<UINT>(kMaxReservations); ++i) {
         const std::wstring section = ReservationSection(i);
         WritePrivateProfileStringW(section.c_str(), nullptr, nullptr, m_iniPath.c_str());
     }
@@ -234,26 +224,24 @@ void ReservationManager::SaveUnlocked() const {
 
 void ReservationManager::RemoveExpired() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    RemoveExpiredUnlocked();
+    if (RemoveExpiredUnlocked()) SaveUnlocked();
 }
 
-void ReservationManager::RemoveExpiredUnlocked() {
+bool ReservationManager::RemoveExpiredUnlocked() {
     SYSTEMTIME now{};
     GetLocalTime(&now);
-    const ULONGLONG nowValue = ToFileTimeValue(now);
+    const ULONGLONG nowValue = ViewReservationTime::FileTimeValue(now);
 
     const auto oldSize = m_items.size();
     m_items.erase(
         std::remove_if(m_items.begin(), m_items.end(), [nowValue](const ReservationItem &item) {
-            const ULONGLONG start = ToFileTimeValue(item.StartTime);
-            const ULONGLONG end = start + (static_cast<ULONGLONG>(item.Duration) * 10000000ULL);
+            const ULONGLONG start = ViewReservationTime::FileTimeValue(item.StartTime);
+            const ULONGLONG end = start + (static_cast<ULONGLONG>(item.Duration) * ViewReservationTime::TicksPerSecond);
             return end <= nowValue;
         }),
         m_items.end());
 
-    if (m_items.size() != oldSize) {
-        SaveUnlocked();
-    }
+    return m_items.size() != oldSize;
 }
 
 bool ReservationManager::IsReserved(WORD nid, WORD tsid, WORD sid, WORD eid) const {
@@ -266,8 +254,8 @@ bool ReservationManager::IsReserved(WORD nid, WORD tsid, WORD sid, WORD eid) con
 bool ReservationManager::AddOrUpdateReservation(const ReservationItem &item, std::wstring *message) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    // 期限切れ予約は競合判定の対象にしない。
-    RemoveExpiredUnlocked();
+    // 期限切れ予約は競合判定の対象にしない。追加が拒否されても削除は保存する。
+    if (RemoveExpiredUnlocked()) SaveUnlocked();
 
     // 同一予約の更新（EPG追従や視聴→録画への種別変更）は自分自身を除外し、
     // それ以外の録画予約と時間帯が重なる場合だけ拒否する。
@@ -309,7 +297,7 @@ bool ReservationManager::AddOrUpdateReservation(const ReservationItem &item, std
 
     for (auto &existing : m_items) {
         if (SameIdentity(existing, item.NetworkID, item.TransportStreamID, item.ServiceID, item.EventID)) {
-            const bool sameStart = ToFileTimeValue(existing.StartTime) == ToFileTimeValue(item.StartTime);
+            const bool sameStart = ViewReservationTime::FileTimeValue(existing.StartTime) == ViewReservationTime::FileTimeValue(item.StartTime);
             const bool sameDuration = existing.Duration == item.Duration;
             const bool sameName = existing.EventName == item.EventName;
 
@@ -383,7 +371,7 @@ bool ReservationManager::AddOrUpdateReservation(const ReservationItem &item, std
 
     if (m_items.size() >= kMaxReservations) {
         auto it = (std::max_element)(m_items.begin(), m_items.end(), [](const ReservationItem &a, const ReservationItem &b) {
-            return ToFileTimeValue(a.StartTime) < ToFileTimeValue(b.StartTime);
+            return ViewReservationTime::FileTimeValue(a.StartTime) < ViewReservationTime::FileTimeValue(b.StartTime);
         });
 
         if (it != m_items.end()) {
@@ -463,7 +451,7 @@ bool ReservationManager::UpdateTimingByIds(
         }
 
         const bool changed =
-            ToFileTimeValue(item.StartTime) != ToFileTimeValue(startTime) ||
+            ViewReservationTime::FileTimeValue(item.StartTime) != ViewReservationTime::FileTimeValue(startTime) ||
             item.Duration != duration ||
             (eventName != nullptr && !eventName->empty() && item.EventName != *eventName);
 

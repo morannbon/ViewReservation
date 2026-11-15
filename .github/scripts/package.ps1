@@ -18,12 +18,12 @@ Copy-Item -LiteralPath 'docs/Documentation_JP.txt' -Destination "$out/docs"
 @"
 ViewReservation v$version ($arch) - ビルド済み配布
 
-TVTest 0.10.0以降で使用するプラグインです。TvAIrのPluginsフォルダへ配置するものではありません。
+TVTest 0.10.0以降で使用するプラグインです。
 Visual Studioでのビルドは不要です。使用しているTVTestと同じアーキテクチャの配布物を選んでください。
-TVTestを終了し、ViewReservation.tvtpをTVTestのPluginsフォルダへ配置します。
-TVTestを起動し、番組表で番組を右クリックして視聴予約・録画予約を確認してください。
+TVTestを終了してViewReservation.tvtpをTVTestのPluginsフォルダへ配置します。
+TVTestを起動します。番組表で番組を右クリックして視聴予約・録画予約を確認してください。
 パネル機能は初期OFFです。プラグイン設定で「パネルを使用する」をONにしてTVTestを再起動してください。
-更新時もTVTestを終了し、同じViewReservation.tvtpを置き換えます。既存ViewReservation.iniを残すと予約とパネル設定を引き継げます。
+更新時もTVTestを終了して同じ場所のViewReservation.tvtpを置き換えます。既存ViewReservation.iniを残すと予約とパネル設定を引き継げます。
 詳しい使用方法はREADMEとdocs/Documentation_JP.txtを参照してください。
 "@ | Set-Content -LiteralPath "$out/INSTALL.txt" -Encoding utf8
 Compress-Archive -Path "$out/*" -DestinationPath "package/ViewReservation_v${version}_${arch}.zip"

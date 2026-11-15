@@ -4,16 +4,30 @@
 #include <windows.h>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cwctype>
-#include <set>
+#include <iterator>
+#include <cstdint>
+#include <limits>
+#include <utility>
 
 #define TVTEST_PLUGIN_CLASS_IMPLEMENT
 #include "ViewReservationPlugin.h"
+#include "PanelIndicatorContrast.h"
+#include "PanelViewportGeometry.h"
+#include "PanelViewportRowIdentity.h"
+#include "PanelWaveBarLayout.h"
+#include "PanelGlyph.h"
+#include <windowsx.h>
+#include "PanelStationPresentation.h"
 #include "Version.h"
+#include "ReservationTime.h"
+#include "ReservationSchedule.h"
+#include <vector>
 
 namespace {
-// nullptr ガード付き wstring 変換（TVTest API の文字列ポインタ受け取り用）
-std::wstring TrimText(const wchar_t *text) {
+// TVTest API が返す任意の文字列を安全にコピーする。
+std::wstring CopyOptionalText(const wchar_t *text) {
     if (text == nullptr) {
         return L"";
     }
@@ -21,7 +35,15 @@ std::wstring TrimText(const wchar_t *text) {
 }
 
 constexpr int kSettingsCheckPanel = 2101;
+constexpr int kSettingsZappingInterval = 2102;
 constexpr UINT kBaseDpi = 96;
+constexpr wchar_t kPanelClassName[] = L"ViewReservation.PanelWindow";
+constexpr wchar_t kPanelHeaderClassName[] = L"ViewReservation.PanelHeader";
+constexpr int kPanelHeaderMargin = 4;
+constexpr int kPanelHeaderGap = 3;
+constexpr int kPanelHeaderHeight = ViewReservationUi::kPanelActionButtonSide;
+constexpr wchar_t kPanelViewportClassName[] = L"ViewReservation.PanelViewport";
+constexpr wchar_t kAutomationBarClassName[] = L"ViewReservation.AutomationBar";
 
 UINT GetWindowDpiOrDefault(HWND hwnd) {
     using GetDpiForWindowFn = UINT (WINAPI *)(HWND);
@@ -58,28 +80,48 @@ COLORREF MixColor(COLORREF a, COLORREF b, int bPercent) {
         (GetBValue(a) * aPercent + GetBValue(b) * bPercent) / 100);
 }
 
-struct PanelSemanticTextColors {
-    COLORREF Station;
-    COLORREF Time;
-    COLORREF CurrentProgram;
-    COLORREF FutureProgram;
+ViewReservationUi::RgbColor ToRgbColor(COLORREF color) {
+    return {
+        static_cast<int>(GetRValue(color)),
+        static_cast<int>(GetGValue(color)),
+        static_cast<int>(GetBValue(color))
+    };
+}
+
+COLORREF ToColorRef(const ViewReservationUi::RgbColor &color) {
+    return RGB(color.Red, color.Green, color.Blue);
+}
+
+COLORREF GetPanelIndicatorColor(COLORREF background, COLORREF preferredText) {
+    return ToColorRef(ViewReservationUi::CalculatePanelIndicatorColor(
+        ToRgbColor(background), ToRgbColor(preferredText)));
+}
+
+struct PanelHostPalette {
+    COLORREF Back;
+    COLORREF Text;
+    COLORREF TabBack;
+    COLORREF TabBack2;
+    COLORREF TabText;
+    COLORREF Border;
 };
 
-// パネル文字色。時刻は番組名から独立させ、情報の階層を色でも判別できるようにする。
-PanelSemanticTextColors GetPanelSemanticTextColors(bool darkSurface) {
-    if (darkSurface) {
-        return {
-            RGB(112, 174, 218), // 局名
-            RGB(184, 190, 198), // 時刻
-            RGB(224, 187, 103), // 現在番組
-            RGB(118, 184, 137)  // 未来番組
-        };
-    }
+COLORREF ResolvePanelHostColor(TVTest::CTVTestApp *app, LPCWSTR name, COLORREF fallback) {
+    const COLORREF value = app != nullptr ? app->GetColor(name) : CLR_INVALID;
+    return value == CLR_INVALID ? fallback : value;
+}
+
+PanelHostPalette ResolvePanelHostPalette(TVTest::CTVTestApp *app) {
+    const COLORREF back = ResolvePanelHostColor(app, L"PanelBack", GetSysColor(COLOR_WINDOW));
+    const COLORREF text = ResolvePanelHostColor(app, L"PanelText", GetSysColor(COLOR_WINDOWTEXT));
+    const COLORREF tabBack = ResolvePanelHostColor(app, L"PanelTabBack", GetSysColor(COLOR_HIGHLIGHT));
     return {
-        RGB(39, 92, 139),   // 局名
-        RGB(82, 88, 96),    // 時刻
-        RGB(132, 91, 28),   // 現在番組
-        RGB(53, 112, 70)    // 未来番組
+        back,
+        text,
+        tabBack,
+        ResolvePanelHostColor(app, L"PanelTabBack2", tabBack),
+        ResolvePanelHostColor(app, L"PanelTabText", text),
+        ResolvePanelHostColor(app, L"PanelTabBorder", MixColor(text, back, 55))
     };
 }
 
@@ -89,6 +131,36 @@ void FillSolid(HDC dc, const RECT &rect, COLORREF color) {
         FillRect(dc, &rect, brush);
         DeleteObject(brush);
     }
+}
+
+// Action buttons and row chevrons share the same palette-composited glyph raster.
+// Painting and viewport eligibility both use kPanelGlyphCanvasSide.
+void DrawPanelGlyph(HDC dc, const RECT &bounds, ViewReservationUi::PanelGlyph glyph,
+    COLORREF foreground, COLORREF background) {
+    if (dc == nullptr) return;
+    constexpr int side = ViewReservationUi::kPanelGlyphCanvasSide;
+    if (bounds.right - bounds.left < side || bounds.bottom - bounds.top < side) return;
+    const auto pixels = ViewReservationUi::ComposePanelGlyph(
+        glyph, ToRgbColor(foreground), ToRgbColor(background));
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = side;
+    info.bmiHeader.biHeight = -side;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    const int x = static_cast<int>(bounds.left) + (static_cast<int>(bounds.right - bounds.left) - side) / 2;
+    const int y = static_cast<int>(bounds.top) + (static_cast<int>(bounds.bottom - bounds.top) - side) / 2;
+    SetDIBitsToDevice(dc, x, y, side, side, 0, 0, 0, side, pixels.data(), &info, DIB_RGB_COLORS);
+}
+
+RECT ToWinRect(const ViewReservationUi::Rect &rect) {
+    return RECT{
+        static_cast<LONG>(rect.Left),
+        static_cast<LONG>(rect.Top),
+        static_cast<LONG>(rect.Right),
+        static_cast<LONG>(rect.Bottom)
+    };
 }
 
 void FillVerticalGradient(HDC dc, const RECT &rect, COLORREF top, COLORREF bottom) {
@@ -104,17 +176,7 @@ void FillVerticalGradient(HDC dc, const RECT &rect, COLORREF top, COLORREF botto
     }
 }
 
-// Owner-draw の1項目をメモリDCへ完成させてから一括転送する。
-// 背景→文字→区切り線が画面へ段階的に見えるのを防ぎ、マーキー再描画時のちらつきを抑える。
-RECT GetClippedPaintRect(HDC dc, const RECT &fallback) {
-    RECT clip{};
-    RECT result{};
-    if (dc != nullptr && GetClipBox(dc, &clip) != ERROR && IntersectRect(&result, &fallback, &clip)) {
-        return result;
-    }
-    return fallback;
-}
-
+// 一覧を更新範囲単位でメモリ上に描画し、画面へまとめて転送する。
 class BufferedPaintSurface {
 public:
     BufferedPaintSurface(HDC target, const RECT &rect)
@@ -186,6 +248,7 @@ struct SettingsDialogState {
     int TextHeight = 0;
     bool Accepted = false;
     bool Enabled = false;
+    int ZappingIntervalSeconds = ViewReservationSettings::DefaultZappingIntervalSeconds;
 };
 
 LRESULT CALLBACK SettingsWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -225,19 +288,30 @@ LRESULT CALLBACK SettingsWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
         const int margin = sx(20);
         const int checkHeight = std::max(sx(28), textHeight + sx(10));
         const int noteHeight = std::max(sx(24), textHeight + sx(6));
+        const int rowHeight = std::max(sx(28), textHeight + sx(10));
         const int buttonHeight = std::max(sx(32), textHeight + sx(12));
         const int buttonWidth = sx(96);
         const int clientWidth = sx(430);
         const int checkTop = sx(18);
-        const int noteTop = checkTop + checkHeight + sx(10);
-        const int buttonTop = sx(105);
+        const int noteTop = checkTop + checkHeight + sx(8);
+        const int zappingTop = noteTop + noteHeight + sx(10);
+        const int buttonTop = zappingTop + rowHeight + sx(18);
+        const int comboWidth = sx(110);
+        const int labelWidth = sx(150);
 
         HWND check = CreateWindowExW(0, L"BUTTON", L"パネルを使用する",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
             margin, checkTop, clientWidth - margin * 2, checkHeight, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsCheckPanel)), g_hinstDLL, nullptr);
-        HWND note = CreateWindowExW(0, L"STATIC", L"変更はTVTest再起動後に反映されます。",
+        HWND note = CreateWindowExW(0, L"STATIC", L"パネルの変更はTVTest再起動後に反映されます。",
             WS_CHILD | WS_VISIBLE,
             margin, noteTop, clientWidth - margin * 2, noteHeight, hwnd, nullptr, g_hinstDLL, nullptr);
+        HWND zappingLabel = CreateWindowExW(0, L"STATIC", L"ザッピング間隔",
+            WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+            margin, zappingTop, labelWidth, rowHeight, hwnd, nullptr, g_hinstDLL, nullptr);
+        HWND zappingCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+            margin + labelWidth + sx(8), zappingTop, comboWidth, rowHeight * 7, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsZappingInterval)), g_hinstDLL, nullptr);
         HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
             clientWidth - margin - buttonWidth * 2 - sx(8), buttonTop, buttonWidth, buttonHeight, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), g_hinstDLL, nullptr);
@@ -245,13 +319,28 @@ LRESULT CALLBACK SettingsWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
             clientWidth - margin - buttonWidth, buttonTop, buttonWidth, buttonHeight, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), g_hinstDLL, nullptr);
 
-        for (HWND child : { check, note, ok, cancel }) {
+        for (HWND child : { check, note, zappingLabel, zappingCombo, ok, cancel }) {
             if (child != nullptr && font != nullptr) {
                 SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
             }
         }
         if (state != nullptr && state->Enabled && check != nullptr) {
             SendMessageW(check, BM_SETCHECK, BST_CHECKED, 0);
+        }
+        if (zappingCombo != nullptr) {
+            int selectedIndex = 0;
+            int index = 0;
+            const int current = state != nullptr ? ViewReservationSettings::NormalizeZappingInterval(state->ZappingIntervalSeconds) : ViewReservationSettings::DefaultZappingIntervalSeconds;
+            for (int seconds : ViewReservationSettings::ZappingIntervalsSeconds) {
+                const std::wstring label = std::to_wstring(seconds) + L"秒";
+                const LRESULT item = SendMessageW(zappingCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+                if (item != CB_ERR && item != CB_ERRSPACE) {
+                    SendMessageW(zappingCombo, CB_SETITEMDATA, static_cast<WPARAM>(item), static_cast<LPARAM>(seconds));
+                    if (seconds == current) selectedIndex = index;
+                    ++index;
+                }
+            }
+            SendMessageW(zappingCombo, CB_SETCURSEL, static_cast<WPARAM>(selectedIndex), 0);
         }
         return 0;
     }
@@ -260,6 +349,13 @@ LRESULT CALLBACK SettingsWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
         if (LOWORD(wParam) == IDOK) {
             if (state != nullptr) {
                 state->Enabled = SendDlgItemMessageW(hwnd, kSettingsCheckPanel, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                const LRESULT selection = SendDlgItemMessageW(hwnd, kSettingsZappingInterval, CB_GETCURSEL, 0, 0);
+                if (selection != CB_ERR) {
+                    const LRESULT data = SendDlgItemMessageW(hwnd, kSettingsZappingInterval, CB_GETITEMDATA, static_cast<WPARAM>(selection), 0);
+                    if (data != CB_ERR) {
+                        state->ZappingIntervalSeconds = ViewReservationSettings::NormalizeZappingInterval(static_cast<int>(data));
+                    }
+                }
                 state->Accepted = true;
             }
             DestroyWindow(hwnd);
@@ -301,6 +397,14 @@ bool CViewReservationPlugin::MatchesProgramIdentity(const ReservationItem &item,
         item.OriginalServiceID == sid &&
         item.OriginalEventID == eid;
     return currentMatch || originalMatch;
+}
+
+const ReservationItem *CViewReservationPlugin::FindMatchingReservation(
+    const std::vector<ReservationItem> &items, WORD nid, WORD tsid, WORD sid, WORD eid) {
+    const auto it = std::find_if(items.begin(), items.end(), [&](const ReservationItem &item) {
+        return MatchesProgramIdentity(item, nid, tsid, sid, eid);
+    });
+    return it != items.end() ? &*it : nullptr;
 }
 
 CViewReservationPlugin::~CViewReservationPlugin() {
@@ -346,6 +450,8 @@ bool CViewReservationPlugin::Initialize() {
         TVTest::PROGRAMGUIDE_EVENT_PROGRAM));
 
     m_panelEnabled = LoadPanelEnabled();
+    m_zappingIntervalSeconds = LoadZappingIntervalSeconds();
+    m_exitTimerHours = LoadExitTimerHours();
     if (m_panelEnabled) {
         m_panelRegistered = RegisterPanelItem(); // 登録失敗でも予約本体は継続する
     }
@@ -361,6 +467,8 @@ bool CViewReservationPlugin::Initialize() {
 }
 
 bool CViewReservationPlugin::Finalize() {
+    StopZapping();
+    StopExitTimer();
     DestroyPanelWindow();
 
     m_stop = true;
@@ -398,8 +506,34 @@ bool CViewReservationPlugin::SavePanelEnabled(bool enabled) const {
         L"Settings", L"PanelEnabled", enabled ? L"1" : L"0", m_iniPath.c_str()) != FALSE;
 }
 
-bool CViewReservationPlugin::ShowPanelSettingsDialog(HWND hwndOwner, bool *enabled) {
-    if (enabled == nullptr) {
+int CViewReservationPlugin::LoadZappingIntervalSeconds() const {
+    if (m_iniPath.empty()) return ViewReservationSettings::DefaultZappingIntervalSeconds;
+    return ViewReservationSettings::NormalizeZappingInterval(GetPrivateProfileIntW(
+        L"Settings", L"ZappingIntervalSeconds", ViewReservationSettings::DefaultZappingIntervalSeconds, m_iniPath.c_str()));
+}
+
+bool CViewReservationPlugin::SaveZappingIntervalSeconds(int seconds) const {
+    if (m_iniPath.empty()) return false;
+    const std::wstring value = std::to_wstring(ViewReservationSettings::NormalizeZappingInterval(seconds));
+    return WritePrivateProfileStringW(
+        L"Settings", L"ZappingIntervalSeconds", value.c_str(), m_iniPath.c_str()) != FALSE;
+}
+
+int CViewReservationPlugin::LoadExitTimerHours() const {
+    if (m_iniPath.empty()) return ViewReservationSettings::DefaultExitTimerHours;
+    return ViewReservationSettings::NormalizeExitTimerHours(GetPrivateProfileIntW(
+        L"Settings", L"ExitTimerHours", ViewReservationSettings::DefaultExitTimerHours, m_iniPath.c_str()));
+}
+
+bool CViewReservationPlugin::SaveExitTimerHours(int hours) const {
+    if (m_iniPath.empty()) return false;
+    const std::wstring value = std::to_wstring(ViewReservationSettings::NormalizeExitTimerHours(hours));
+    return WritePrivateProfileStringW(
+        L"Settings", L"ExitTimerHours", value.c_str(), m_iniPath.c_str()) != FALSE;
+}
+
+bool CViewReservationPlugin::ShowPanelSettingsDialog(HWND hwndOwner, bool *enabled, int *zappingIntervalSeconds) {
+    if (enabled == nullptr || zappingIntervalSeconds == nullptr) {
         return false;
     }
 
@@ -417,10 +551,11 @@ bool CViewReservationPlugin::ShowPanelSettingsDialog(HWND hwndOwner, bool *enabl
 
     SettingsDialogState state{};
     state.Enabled = *enabled;
+    state.ZappingIntervalSeconds = ViewReservationSettings::NormalizeZappingInterval(*zappingIntervalSeconds);
     state.Dpi = GetWindowDpiOrDefault(hwndOwner);
 
     const int width = ScaleForDpi(430, state.Dpi);
-    const int height = ScaleForDpi(180, state.Dpi);
+    const int height = ScaleForDpi(230, state.Dpi);
 
     RECT ownerRect{};
     int x = CW_USEDEFAULT;
@@ -467,19 +602,29 @@ bool CViewReservationPlugin::ShowPanelSettingsDialog(HWND hwndOwner, bool *enabl
         return false;
     }
     *enabled = state.Enabled;
+    *zappingIntervalSeconds = ViewReservationSettings::NormalizeZappingInterval(state.ZappingIntervalSeconds);
     return true;
 }
 
 bool CViewReservationPlugin::OnPluginSettings(HWND hwndOwner) {
     bool enabled = LoadPanelEnabled();
-    if (!ShowPanelSettingsDialog(hwndOwner, &enabled)) {
+    int zappingIntervalSeconds = LoadZappingIntervalSeconds();
+    if (!ShowPanelSettingsDialog(hwndOwner, &enabled, &zappingIntervalSeconds)) {
         return false;
     }
-    if (!SavePanelEnabled(enabled)) {
+    if (!SavePanelEnabled(enabled) || !SaveZappingIntervalSeconds(zappingIntervalSeconds)) {
         MessageBoxW(hwndOwner, L"設定を保存できませんでした。", L"ViewReservation", MB_OK | MB_ICONERROR);
         return false;
     }
     m_panelEnabled = enabled;
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        m_zappingIntervalSeconds = ViewReservationSettings::NormalizeZappingInterval(zappingIntervalSeconds);
+        if (m_zappingActive) {
+            m_zappingNextTick = GetTickMs() + static_cast<ULONGLONG>(m_zappingIntervalSeconds) * 1000ULL;
+        }
+    }
+    m_cv.notify_all();
     return true;
 }
 
@@ -519,6 +664,7 @@ bool CViewReservationPlugin::OnPanelItemNotify(TVTest::PanelItemEventInfo *pInfo
             SetTimer(m_panelWindow, kPanelRefreshTimerId, kPanelRefreshIntervalMs, nullptr);
         }
         RefreshPanelRows(false);
+        UpdatePanelViewingProjection(true);
         return true;
 
     case TVTest::PANEL_ITEM_EVENT_DEACTIVATE:
@@ -550,9 +696,7 @@ bool CViewReservationPlugin::OnPanelItemNotify(TVTest::PanelItemEventInfo *pInfo
     case TVTest::PANEL_ITEM_EVENT_FONTCHANGED:
         UpdatePanelFont();
         if (m_panelWindow != nullptr) {
-            RECT rc{};
-            GetClientRect(m_panelWindow, &rc);
-            LayoutPanel(rc.right - rc.left, rc.bottom - rc.top);
+            LayoutPanel();
             InvalidateRect(m_panelWindow, nullptr, FALSE);
         }
         return true;
@@ -566,17 +710,52 @@ bool CViewReservationPlugin::CreatePanelWindow(TVTest::PanelItemCreateEventInfo 
         return false;
     }
 
-    static constexpr wchar_t kPanelClassName[] = L"ViewReservation.PanelWindow";
+    WNDCLASSEXW panelClass{};
+    panelClass.cbSize = sizeof(panelClass);
+    panelClass.lpfnWndProc = PanelWindowProc;
+    panelClass.hInstance = g_hinstDLL;
+    panelClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    panelClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    panelClass.lpszClassName = kPanelClassName;
+    if (RegisterClassExW(&panelClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return false;
+    }
 
-    WNDCLASSEXW wc{};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = PanelWindowProc;
-    wc.hInstance = g_hinstDLL;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-    wc.lpszClassName = kPanelClassName;
+    WNDCLASSEXW headerClass{};
+    headerClass.cbSize = sizeof(headerClass);
+    headerClass.lpfnWndProc = PanelHeaderProc;
+    headerClass.hInstance = g_hinstDLL;
+    headerClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    headerClass.lpszClassName = kPanelHeaderClassName;
+    if (RegisterClassExW(&headerClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        UnregisterClassW(kPanelClassName, g_hinstDLL);
+        return false;
+    }
 
-    if (RegisterClassExW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    WNDCLASSEXW viewportClass{};
+    viewportClass.cbSize = sizeof(viewportClass);
+    viewportClass.lpfnWndProc = PanelViewportProc;
+    viewportClass.hInstance = g_hinstDLL;
+    viewportClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    viewportClass.style = CS_DBLCLKS;
+    viewportClass.lpszClassName = kPanelViewportClassName;
+    if (RegisterClassExW(&viewportClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        UnregisterClassW(kPanelHeaderClassName, g_hinstDLL);
+        UnregisterClassW(kPanelClassName, g_hinstDLL);
+        return false;
+    }
+
+    WNDCLASSEXW automationClass{};
+    automationClass.cbSize = sizeof(automationClass);
+    automationClass.lpfnWndProc = AutomationBarProc;
+    automationClass.hInstance = g_hinstDLL;
+    automationClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    automationClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    automationClass.lpszClassName = kAutomationBarClassName;
+    if (RegisterClassExW(&automationClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        UnregisterClassW(kPanelViewportClassName, g_hinstDLL);
+        UnregisterClassW(kPanelHeaderClassName, g_hinstDLL);
+        UnregisterClassW(kPanelClassName, g_hinstDLL);
         return false;
     }
 
@@ -598,84 +777,205 @@ bool CViewReservationPlugin::CreatePanelWindow(TVTest::PanelItemCreateEventInfo 
         this);
 
     if (m_panelWindow == nullptr) {
+        UnregisterClassW(kAutomationBarClassName, g_hinstDLL);
+        UnregisterClassW(kPanelViewportClassName, g_hinstDLL);
+        UnregisterClassW(kPanelHeaderClassName, g_hinstDLL);
+        UnregisterClassW(kPanelClassName, g_hinstDLL);
         return false;
     }
 
     pInfo->hwndItem = m_panelWindow;
     RefreshPanelRows(true);
+    UpdatePanelViewingProjection(true);
     return true;
 }
 
 void CViewReservationPlugin::DestroyPanelWindow() {
     if (m_panelWindow != nullptr) {
-        KillTimer(m_panelWindow, kPanelRefreshTimerId);
-        KillTimer(m_panelWindow, kPanelMarqueeTimerId);
-        KillTimer(m_panelWindow, kPanelMarqueeDelayTimerId);
         DestroyWindow(m_panelWindow);
-        m_panelWindow = nullptr;
+    } else {
+        ReleasePanelWindowResources(nullptr);
     }
-    m_panelList = nullptr;
-    m_panelStatus = nullptr;
-    m_panelListOriginalProc = nullptr;
+    UnregisterClassW(kAutomationBarClassName, g_hinstDLL);
+    UnregisterClassW(kPanelViewportClassName, g_hinstDLL);
+    UnregisterClassW(kPanelHeaderClassName, g_hinstDLL);
+    UnregisterClassW(kPanelClassName, g_hinstDLL);
+}
+
+void CViewReservationPlugin::ReleasePanelWindowResources(HWND destroyedWindow) {
+    if (destroyedWindow != nullptr) {
+        KillTimer(destroyedWindow, kPanelRefreshTimerId);
+        KillTimer(destroyedWindow, kPanelMarqueeTimerId);
+        KillTimer(destroyedWindow, kPanelMarqueeDelayTimerId);
+    }
     if (m_panelFont != nullptr) {
         DeleteObject(m_panelFont);
         m_panelFont = nullptr;
+    }
+    if (m_panelAutomationFont != nullptr) {
+        DeleteObject(m_panelAutomationFont);
+        m_panelAutomationFont = nullptr;
     }
     if (m_panelBackBrush != nullptr) {
         DeleteObject(m_panelBackBrush);
         m_panelBackBrush = nullptr;
         m_panelBackBrushColor = CLR_INVALID;
     }
-    m_panelRows.clear();
-    m_panelExpandedChannels.clear();
-    m_panelWave = PanelWave::Terrestrial;
-    m_panelCatvAvailable = false;
-    UnregisterClassW(L"ViewReservation.PanelWindow", g_hinstDLL);
+    if (destroyedWindow == nullptr || m_panelWindow == destroyedWindow) {
+        m_panelWindow = nullptr;
+        m_panelAutomationBar = nullptr;
+        m_panelHeader = nullptr;
+        m_panelHeaderPressed = ViewReservationUi::PanelWaveBarLayout::Item::None;
+        m_panelHeaderFocused = ViewReservationUi::PanelWaveBarLayout::Item::Terrestrial;
+        m_panelViewport = nullptr;
+        m_panelStatus = nullptr;
+        m_panelViewportScrollY = 0;
+        m_panelSelectedRow = -1;
+        m_panelWheelRemainder = 0;
+        m_panelRows.clear();
+        m_panelExpandedChannels.clear();
+        m_panelViewingProjection = PanelViewingProjection{};
+        m_panelWave = PanelWave::Terrestrial;
+        m_panelRowsWave = PanelWave::Terrestrial;
+        m_panelCatvAvailable = false;
+    }
 }
 
-void CViewReservationPlugin::LayoutPanel(int width, int height) {
+HBRUSH CViewReservationPlugin::EnsurePanelBackBrush(COLORREF color) {
+    if (m_panelBackBrush == nullptr || m_panelBackBrushColor != color) {
+        if (m_panelBackBrush != nullptr) DeleteObject(m_panelBackBrush);
+        m_panelBackBrush = CreateSolidBrush(color);
+        m_panelBackBrushColor = m_panelBackBrush != nullptr ? color : CLR_INVALID;
+    }
+    return m_panelBackBrush;
+}
+
+void CViewReservationPlugin::LayoutPanel() {
     if (m_panelWindow == nullptr) {
         return;
     }
 
-    constexpr int margin = 4;
-    constexpr int gap = 3;
-    constexpr int waveHeight = 24;
-    const int waveCount = m_panelCatvAvailable ? 4 : 3;
-    const int totalGap = gap * (waveCount - 1);
-    const int waveWidth = (std::max)(34, (width - margin * 2 - totalGap) / waveCount);
-    const int listTop = margin + waveHeight + gap;
-    const int listHeight = (std::max)(20, height - listTop - margin);
-
-    HWND gr = GetDlgItem(m_panelWindow, kControlWaveGr);
-    HWND bs = GetDlgItem(m_panelWindow, kControlWaveBs);
-    HWND cs = GetDlgItem(m_panelWindow, kControlWaveCs);
-    HWND catv = GetDlgItem(m_panelWindow, kControlWaveCatv);
-
-    if (gr != nullptr) MoveWindow(gr, margin, margin, waveWidth, waveHeight, TRUE);
-    if (bs != nullptr) MoveWindow(bs, margin + waveWidth + gap, margin, waveWidth, waveHeight, TRUE);
-    if (cs != nullptr) MoveWindow(cs, margin + (waveWidth + gap) * 2, margin, waveWidth, waveHeight, TRUE);
-    if (catv != nullptr) {
-        if (m_panelCatvAvailable) {
-            MoveWindow(catv, margin + (waveWidth + gap) * 3, margin, waveWidth, waveHeight, TRUE);
-            ShowWindow(catv, SW_SHOWNOACTIVATE);
-        } else {
-            ShowWindow(catv, SW_HIDE);
-        }
+    RECT client{};
+    if (!GetClientRect(m_panelWindow, &client)) {
+        return;
     }
 
-    const int listWidth = (std::max)(20, width - margin * 2);
-    if (m_panelList != nullptr) {
+    const int width = static_cast<int>(client.right - client.left);
+    const int height = static_cast<int>(client.bottom - client.top);
+    constexpr int margin = kPanelHeaderMargin;
+    constexpr int gap = kPanelHeaderGap;
+    constexpr int waveHeight = kPanelHeaderHeight;
+    const int listTop = margin + waveHeight + gap;
+    const UINT dpi = GetWindowDpiOrDefault(m_panelWindow);
+    const int automationBarHeight = (std::max)(24, ScaleForDpi(28, dpi));
+    const int automationTop = (std::max)(listTop + gap, height - margin - automationBarHeight);
+    const int listHeight = (std::max)(0, automationTop - gap - listTop);
+
+    // One header window is laid out and repainted as a single surface. Its
+    // native child rectangles cannot collide during repeated WM_SIZE messages.
+    if (m_panelHeader != nullptr) {
+        SetWindowPos(m_panelHeader, nullptr, margin, margin,
+            (std::max)(0, width - 2 * margin), waveHeight,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(m_panelHeader, nullptr, FALSE);
+    }
+
+    const int contentWidth = (std::max)(20, width - margin * 2);
+    if (m_panelViewport != nullptr) {
+        const auto prior = GetPanelViewportGeometry().CaptureAnchor();
         ResetPanelMarqueeForLayoutChange();
-        SetWindowPos(m_panelList, nullptr, margin, listTop, listWidth, listHeight,
+        SetWindowPos(m_panelViewport, nullptr, margin, listTop, contentWidth, listHeight,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
-        RedrawWindow(m_panelList, nullptr, nullptr,
-            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        const auto resized = GetPanelViewportGeometry();
+        SetPanelViewportScrollY(resized.RestoreAnchor(prior, prior.Row));
+        RedrawWindow(m_panelViewport, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
     }
     if (m_panelStatus != nullptr) {
-        const int statusHeight = (std::min)(48, (std::max)(28, listHeight / 5));
-        MoveWindow(m_panelStatus, margin, listTop, listWidth, statusHeight, TRUE);
+        const int statusHeight = (std::min)(listHeight, (std::min)(48, (std::max)(28, listHeight / 5)));
+        MoveWindow(m_panelStatus, margin, listTop, contentWidth, statusHeight, TRUE);
     }
+
+    if (m_panelAutomationBar != nullptr) {
+        MoveWindow(m_panelAutomationBar, margin, automationTop, contentWidth, automationBarHeight, TRUE);
+        InvalidateRect(m_panelAutomationBar, nullptr, FALSE);
+    }
+}
+
+ViewReservationUi::AutomationBarLayout CViewReservationPlugin::CalculateAutomationBarLayout(HDC dc) const {
+    if (m_panelAutomationBar == nullptr) {
+        return {};
+    }
+
+    RECT client{};
+    if (!GetClientRect(m_panelAutomationBar, &client)) {
+        return {};
+    }
+
+    HDC measureDc = dc;
+    bool ownsDc = false;
+    if (measureDc == nullptr) {
+        measureDc = GetDC(m_panelAutomationBar);
+        ownsDc = measureDc != nullptr;
+    }
+
+    const UINT dpi = GetWindowDpiOrDefault(m_panelAutomationBar);
+    HFONT font = m_panelAutomationFont != nullptr
+        ? m_panelAutomationFont
+        : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    HGDIOBJ oldFont = measureDc != nullptr && font != nullptr
+        ? SelectObject(measureDc, font)
+        : nullptr;
+
+    auto textWidth = [&](const wchar_t *sample) {
+        SIZE size{};
+        if (measureDc != nullptr && sample != nullptr &&
+            GetTextExtentPoint32W(measureDc, sample, lstrlenW(sample), &size)) {
+            return static_cast<int>(size.cx);
+        }
+        return 0;
+    };
+
+    ViewReservationUi::AutomationBarMetrics metrics{};
+    metrics.ClientWidth = static_cast<int>(client.right - client.left);
+    metrics.ClientHeight = static_cast<int>(client.bottom - client.top);
+    metrics.SidePadding = ScaleForDpi(8, dpi);
+    metrics.ControlHeight = ScaleForDpi(22, dpi);
+    metrics.LabelGap = ScaleForDpi(7, dpi);
+    metrics.StatusGap = ScaleForDpi(9, dpi);
+    metrics.ControlGap = ScaleForDpi(9, dpi);
+    metrics.CenterGap = ScaleForDpi(8, dpi);
+    metrics.RightGroupPadding = ScaleForDpi(9, dpi);
+    metrics.SeparatorWidth = (std::max)(1, ScaleForDpi(1, dpi));
+
+    metrics.ZappingLabelWidth = textWidth(L"ザッピング");
+    metrics.ExitLabelWidth = textWidth(L"終了");
+
+    const int zappingStatusTextWidth = (std::max)(textWidth(L"停止中"), textWidth(L"巡回中"));
+    const int toggleTextWidth = (std::max)(textWidth(L"開始"), textWidth(L"停止"));
+    const int exitHoursTextWidth = textWidth(L"6h▼");
+
+    metrics.ZappingStatusWidth = (std::max)(
+        ScaleForDpi(42, dpi),
+        zappingStatusTextWidth + ScaleForDpi(14, dpi));
+    metrics.ZappingToggleWidth = (std::max)(
+        ScaleForDpi(44, dpi),
+        toggleTextWidth + ScaleForDpi(16, dpi));
+    metrics.ExitHoursWidth = (std::max)(
+        ScaleForDpi(45, dpi),
+        exitHoursTextWidth + ScaleForDpi(10, dpi));
+    metrics.ExitToggleWidth = (std::max)(
+        ScaleForDpi(38, dpi),
+        toggleTextWidth + ScaleForDpi(12, dpi));
+
+    if (oldFont != nullptr) {
+        SelectObject(measureDc, oldFont);
+    }
+    if (ownsDc) {
+        ReleaseDC(m_panelAutomationBar, measureDc);
+    }
+
+    return ViewReservationUi::CalculateAutomationBarLayout(metrics);
 }
 
 void CViewReservationPlugin::UpdatePanelFont() {
@@ -684,24 +984,39 @@ void CViewReservationPlugin::UpdatePanelFont() {
     }
 
     HFONT nextFont = nullptr;
+    HFONT nextAutomationFont = nullptr;
     LOGFONTW logFont{};
     const int dpi = static_cast<int>(GetWindowDpiOrDefault(m_panelWindow));
     if (m_pApp->GetFont(L"PanelFont", &logFont, dpi)) {
         nextFont = CreateFontIndirectW(&logFont);
+
+        // 下端操作は番組表より一段小さい文字を正本とする。
+        // 同じPanelFontから派生させ、DPIを揃えたままサイズだけを抑える。
+        LOGFONTW automationLogFont = logFont;
+        automationLogFont.lfHeight = MulDiv(logFont.lfHeight, kPanelAutomationFontPercent, 100);
+        if (automationLogFont.lfHeight == 0) {
+            automationLogFont.lfHeight = logFont.lfHeight < 0 ? -1 : 1;
+        }
+        nextAutomationFont = CreateFontIndirectW(&automationLogFont);
     }
 
     HFONT applyFont = nextFont != nullptr ? nextFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    for (const int id : { kControlWaveGr, kControlWaveBs, kControlWaveCs, kControlWaveCatv, kControlList, kControlStatus }) {
+    for (const int id : { kControlViewport, kControlStatus }) {
         HWND control = GetDlgItem(m_panelWindow, id);
         if (control != nullptr) {
             SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(applyFont), TRUE);
         }
     }
 
-    if (m_panelFont != nullptr) {
-        DeleteObject(m_panelFont);
-    }
+    if (m_panelFont != nullptr) DeleteObject(m_panelFont);
+    if (m_panelAutomationFont != nullptr) DeleteObject(m_panelAutomationFont);
     m_panelFont = nextFont;
+    m_panelAutomationFont = nextAutomationFont;
+
+    if (m_panelHeader != nullptr) InvalidateRect(m_panelHeader, nullptr, FALSE);
+    if (m_panelAutomationBar != nullptr) {
+        InvalidateRect(m_panelAutomationBar, nullptr, FALSE);
+    }
 }
 
 bool CViewReservationPlugin::BuildPanelPrograms(
@@ -725,8 +1040,8 @@ bool CViewReservationPlugin::BuildPanelPrograms(
 
     SYSTEMTIME now{};
     GetLocalTime(&now);
-    const ULONGLONG nowValue = FileTimeOf(now);
-    const ULONGLONG horizonValue = nowValue + kPanelFutureHorizonSec * 10000000ULL;
+    const ULONGLONG nowValue = ViewReservationTime::FileTimeValue(now);
+    const ULONGLONG horizonValue = nowValue + kPanelFutureHorizonSec * ViewReservationTime::TicksPerSecond;
     bool foundCurrent = false;
 
     auto makeItem = [&](const TVTest::EpgEventInfo *ev) {
@@ -741,7 +1056,7 @@ bool CViewReservationPlugin::BuildPanelPrograms(
         item.OriginalEventID = item.EventID;
         item.StartTime = ev->StartTime;
         item.Duration = ev->Duration;
-        item.EventName = TrimText(ev->pszEventName);
+        item.EventName = CopyOptionalText(ev->pszEventName);
         item.LastDriverName = channel.DriverName;
         if (item.EventName.empty()) {
             item.EventName = L"(番組名なし)";
@@ -755,8 +1070,8 @@ bool CViewReservationPlugin::BuildPanelPrograms(
             continue;
         }
 
-        const ULONGLONG start = FileTimeOf(ev->StartTime);
-        const ULONGLONG endTime = start + static_cast<ULONGLONG>(ev->Duration) * 10000000ULL;
+        const ULONGLONG start = ViewReservationTime::FileTimeValue(ev->StartTime);
+        const ULONGLONG endTime = start + static_cast<ULONGLONG>(ev->Duration) * ViewReservationTime::TicksPerSecond;
         if (start <= nowValue && nowValue < endTime) {
             *current = makeItem(ev);
             foundCurrent = true;
@@ -769,15 +1084,133 @@ bool CViewReservationPlugin::BuildPanelPrograms(
     }
 
     std::stable_sort(future->begin(), future->end(), [](const ReservationItem &a, const ReservationItem &b) {
-        return FileTimeOf(a.StartTime) < FileTimeOf(b.StartTime);
+        return ViewReservationTime::FileTimeValue(a.StartTime) < ViewReservationTime::FileTimeValue(b.StartTime);
     });
 
     m_pApp->FreeEpgEventList(&list);
     return foundCurrent;
 }
 
+CViewReservationPlugin::PanelWave CViewReservationPlugin::ResolvePanelWave(const DriverChannelEntry &entry) {
+    switch (ResolveChannelDisplayWave(entry)) {
+    case ChannelDisplayWave::Bs: return PanelWave::Bs;
+    case ChannelDisplayWave::Cs: return PanelWave::Cs;
+    case ChannelDisplayWave::Catv: return PanelWave::Catv;
+    default: return PanelWave::Terrestrial;
+    }
+}
+
+CViewReservationPlugin::PanelViewingProjection CViewReservationPlugin::CapturePanelViewingProjection() const {
+    PanelViewingProjection projection{};
+    if (m_pApp == nullptr) return projection;
+
+    TVTest::ChannelInfo current{};
+    current.Size = sizeof(current);
+    if (!m_pApp->GetCurrentChannelInfo(&current)) return projection;
+
+    DriverChannelEntry entry{};
+    entry.NetworkID = current.NetworkID;
+    entry.TransportStreamID = current.TransportStreamID;
+    entry.ServiceID = current.ServiceID;
+    projection.ChannelKey = MakeChannelServiceKey(entry);
+    if (projection.ChannelKey == 0) return projection;
+
+    projection.HasCurrentService = true;
+    projection.Wave = ResolvePanelWave(entry);
+    bool zapping = false;
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        zapping = m_zappingActive && m_zappingWave == projection.Wave;
+    }
+    projection.Emphasis = zapping
+        ? ViewReservationUi::PanelStationEmphasis::Zapping
+        : ViewReservationUi::PanelStationEmphasis::Viewing;
+    return projection;
+}
+
+void CViewReservationPlugin::CenterPanelViewingChannel(ULONGLONG channelKey) {
+    if (m_panelViewport == nullptr || channelKey == 0) return;
+    int targetIndex = -1;
+    for (size_t i = 0; i < m_panelRows.size(); ++i) {
+        if (!m_panelRows[i].IsFuture && m_panelRows[i].ChannelKey == channelKey) {
+            targetIndex = static_cast<int>(i);
+            break;
+        }
+    }
+    if (targetIndex >= 0) {
+        SetPanelViewportScrollY(GetPanelViewportGeometry().Scroll(ViewReservationUi::PanelViewportGeometry::ScrollAction::Center, targetIndex));
+    }
+}
+
+ViewReservationUi::PanelViewportGeometry CViewReservationPlugin::GetPanelViewportGeometry() const {
+    ViewReservationUi::PanelViewportGeometry geometry;
+    geometry.Heights.reserve(m_panelRows.size());
+    for (const auto &row : m_panelRows) {
+        geometry.Heights.push_back(row.IsFuture ? kPanelFutureRowHeight : kPanelCurrentRowHeight);
+    }
+    RECT client{};
+    if (m_panelViewport != nullptr && GetClientRect(m_panelViewport, &client)) {
+        geometry.Height = static_cast<int>(client.bottom - client.top);
+    }
+    geometry.ScrollY = geometry.ClampScroll(m_panelViewportScrollY);
+    return geometry;
+}
+
+bool CViewReservationPlugin::GetPanelViewportRowRect(int index, RECT *rect) const {
+    if (rect == nullptr || m_panelViewport == nullptr) return false;
+    const auto geometry = GetPanelViewportGeometry();
+    int top = 0, bottom = 0;
+    if (!geometry.RowRect(index, &top, &bottom)) return false;
+    RECT client{};
+    GetClientRect(m_panelViewport, &client);
+    *rect = {client.left, top, client.right, bottom};
+    return true;
+}
+
+void CViewReservationPlugin::InvalidatePanelViewportRow(int index) const {
+    RECT rect{};
+    if (GetPanelViewportRowRect(index, &rect)) {
+        InvalidateRect(m_panelViewport, &rect, FALSE);
+    }
+}
+
+void CViewReservationPlugin::SetPanelViewportScrollY(int scrollY) {
+    if (m_panelViewport == nullptr) return;
+    const auto geometry = GetPanelViewportGeometry();
+    const int next = geometry.ClampScroll(scrollY);
+    if (next != m_panelViewportScrollY) {
+        m_panelViewportScrollY = next;
+        ResetPanelMarqueeForLayoutChange();
+        InvalidateRect(m_panelViewport, nullptr, FALSE);
+    }
+    SCROLLINFO info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    info.nMin = 0;
+    info.nMax = (std::max)(0, geometry.TotalHeight() - 1);
+    info.nPage = static_cast<UINT>((std::max)(0, geometry.Height));
+    info.nPos = m_panelViewportScrollY;
+    SetScrollInfo(m_panelViewport, SB_VERT, &info, TRUE);
+}
+
+void CViewReservationPlugin::UpdatePanelViewingProjection(bool centerCurrent) {
+    const PanelViewingProjection next = CapturePanelViewingProjection();
+    const bool changed =
+        next.HasCurrentService != m_panelViewingProjection.HasCurrentService ||
+        next.ChannelKey != m_panelViewingProjection.ChannelKey ||
+        next.Wave != m_panelViewingProjection.Wave ||
+        next.Emphasis != m_panelViewingProjection.Emphasis;
+
+    m_panelViewingProjection = next;
+    if (changed && m_panelViewport != nullptr)
+        InvalidateRect(m_panelViewport, nullptr, FALSE);
+
+    if (centerCurrent && next.HasCurrentService && next.Wave == m_panelWave)
+        CenterPanelViewingChannel(next.ChannelKey);
+}
+
 void CViewReservationPlugin::RefreshPanelRows(bool forceDriverCache) {
-    if (m_panelList == nullptr || m_pApp == nullptr) {
+    if (m_panelViewport == nullptr || m_pApp == nullptr) {
         return;
     }
 
@@ -790,37 +1223,21 @@ void CViewReservationPlugin::RefreshPanelRows(bool forceDriverCache) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
-    const LRESULT oldSelection = SendMessageW(m_panelList, LB_GETCURSEL, 0, 0);
+    const int oldSelection = m_panelSelectedRow;
     ULONGLONG oldChannelKey = 0;
     WORD oldEventId = 0;
-    if (oldSelection != LB_ERR && static_cast<size_t>(oldSelection) < m_panelRows.size()) {
+    bool oldSelectionWasFuture = false;
+    if (oldSelection >= 0 && static_cast<size_t>(oldSelection) < m_panelRows.size()) {
         const auto &oldRow = m_panelRows[static_cast<size_t>(oldSelection)];
         oldChannelKey = oldRow.ChannelKey;
         oldEventId = oldRow.Program.EventID;
+        oldSelectionWasFuture = oldRow.IsFuture;
     }
 
-    const LRESULT oldTopIndex = SendMessageW(m_panelList, LB_GETTOPINDEX, 0, 0);
-    ULONGLONG oldTopChannelKey = 0;
-    WORD oldTopEventId = 0;
-    bool oldTopWasFuture = false;
-    if (oldTopIndex != LB_ERR && oldTopIndex >= 0 && static_cast<size_t>(oldTopIndex) < m_panelRows.size()) {
-        const auto &topRow = m_panelRows[static_cast<size_t>(oldTopIndex)];
-        oldTopChannelKey = topRow.ChannelKey;
-        oldTopEventId = topRow.Program.EventID;
-        oldTopWasFuture = topRow.IsFuture;
-    }
+    const auto oldAnchorCandidate = GetPanelViewportGeometry().CaptureAnchor();
 
     m_driverCache.RebuildIfNeeded(m_pApp, forceDriverCache);
-    auto channels = m_driverCache.Snapshot();
-
-    auto normalizeSpace = [](const DriverChannelEntry &entry) -> PanelWave {
-        switch (ResolveChannelDisplayWave(entry)) {
-        case ChannelDisplayWave::Bs: return PanelWave::Bs;
-        case ChannelDisplayWave::Cs: return PanelWave::Cs;
-        case ChannelDisplayWave::Catv: return PanelWave::Catv;
-        default: return PanelWave::Terrestrial;
-        }
-    };
+    auto channels = m_driverCache.SnapshotDisplayServices();
 
     const bool catvAvailable = std::any_of(channels.begin(), channels.end(), [](const DriverChannelEntry &entry) {
         return ResolveChannelDisplayWave(entry) == ChannelDisplayWave::Catv;
@@ -831,44 +1248,43 @@ void CViewReservationPlugin::RefreshPanelRows(bool forceDriverCache) {
             m_panelWave = PanelWave::Terrestrial;
         }
         if (m_panelWindow != nullptr) {
-            RECT panelRect{};
-            GetClientRect(m_panelWindow, &panelRect);
-            LayoutPanel(static_cast<int>(panelRect.right - panelRect.left),
-                static_cast<int>(panelRect.bottom - panelRect.top));
+            LayoutPanel();
         }
     }
 
-    // Preserve the channel order returned by TVTest / the BonDriver tuning-space list.
-    // The panel must not impose its own station-name or service-ID ordering.
-    std::set<ULONGLONG> seen;
+    const bool sameWave = m_panelRowsWave == m_panelWave;
+    const auto oldAnchor = sameWave ? oldAnchorCandidate
+        : ViewReservationUi::PanelViewportGeometry::Anchor{};
+    const int oldTopIndex = oldAnchor.Row;
+    ULONGLONG oldTopChannelKey = 0;
+    WORD oldTopEventId = 0;
+    bool oldTopWasFuture = false;
+    if (oldTopIndex >= 0 && static_cast<size_t>(oldTopIndex) < m_panelRows.size()) {
+        const auto &topRow = m_panelRows[static_cast<size_t>(oldTopIndex)];
+        oldTopChannelKey = topRow.ChannelKey;
+        oldTopEventId = topRow.Program.EventID;
+        oldTopWasFuture = topRow.IsFuture;
+    }
+
+    // TVTestで有効な局だけを、TVTest / BonDriverの順序のまま表示する。
+    // 同一NID/TSID/SIDはDriverCache側の表示正本で1局に統合済み。
     const auto reservations = m_manager != nullptr ? m_manager->Snapshot() : std::vector<ReservationItem>{};
     auto reservationKindOf = [&](const ReservationItem &program) {
-        if (program.EventID == 0) {
-            return PanelReservationKind::None;
-        }
-        for (const auto &existing : reservations) {
-            if (MatchesProgramIdentity(existing, program.NetworkID, program.TransportStreamID,
-                    program.ServiceID, program.EventID)) {
-                return existing.RecordOnTrigger ? PanelReservationKind::Record : PanelReservationKind::View;
-            }
-        }
-        return PanelReservationKind::None;
+        if (program.EventID == 0) return PanelReservationKind::None;
+        const ReservationItem *existing = FindMatchingReservation(
+            reservations, program.NetworkID, program.TransportStreamID, program.ServiceID, program.EventID);
+        if (existing == nullptr) return PanelReservationKind::None;
+        return existing->RecordOnTrigger ? PanelReservationKind::Record : PanelReservationKind::View;
     };
 
     std::vector<PanelRow> rows;
     for (auto channel : channels) {
-        const PanelWave channelWave = normalizeSpace(channel);
+        const PanelWave channelWave = ResolvePanelWave(channel);
         if (channelWave != m_panelWave) {
             continue;
         }
 
-        const ULONGLONG key =
-            (static_cast<ULONGLONG>(channel.NetworkID) << 32) |
-            (static_cast<ULONGLONG>(channel.TransportStreamID) << 16) |
-            static_cast<ULONGLONG>(channel.ServiceID);
-        if (!seen.insert(key).second) {
-            continue;
-        }
+        const ULONGLONG key = MakeChannelServiceKey(channel);
 
         ReservationItem current{};
         std::vector<ReservationItem> future;
@@ -919,7 +1335,7 @@ void CViewReservationPlugin::RefreshPanelRows(bool forceDriverCache) {
             a.ReservationKind == b.ReservationKind &&
             a.Channel.ChannelName == b.Channel.ChannelName &&
             a.Program.EventID == b.Program.EventID &&
-            FileTimeOf(a.Program.StartTime) == FileTimeOf(b.Program.StartTime) &&
+            ViewReservationTime::FileTimeValue(a.Program.StartTime) == ViewReservationTime::FileTimeValue(b.Program.StartTime) &&
             a.Program.Duration == b.Program.Duration &&
             a.Program.EventName == b.Program.EventName;
     };
@@ -933,11 +1349,17 @@ void CViewReservationPlugin::RefreshPanelRows(bool forceDriverCache) {
         }
     }
     if (!rowsChanged) {
+        if (!sameWave) {
+            m_panelSelectedRow = -1;
+            SetPanelViewportScrollY(0);
+        }
+        m_panelRowsWave = m_panelWave;
         if (showStatus) ShowWindow(m_panelStatus, SW_HIDE);
         return;
     }
 
     m_panelRows.swap(rows);
+    m_panelRowsWave = m_panelWave;
     m_panelHoverRow = -1;
     m_panelMarqueeActive = false;
     m_panelMouseTracking = false;
@@ -946,45 +1368,40 @@ void CViewReservationPlugin::RefreshPanelRows(bool forceDriverCache) {
         KillTimer(m_panelWindow, kPanelMarqueeDelayTimerId);
     }
     m_panelMarqueeEpochTick = GetTickMs();
-    SendMessageW(m_panelList, WM_SETREDRAW, FALSE, 0);
-    SendMessageW(m_panelList, LB_RESETCONTENT, 0, 0);
-
-    int selectIndex = -1;
-    int topIndex = -1;
-    for (size_t i = 0; i < m_panelRows.size(); ++i) {
-        SendMessageW(m_panelList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(m_panelRows[i].DisplayText.c_str()));
-        if (selectIndex < 0 && oldSelection != LB_ERR && m_panelRows[i].ChannelKey == oldChannelKey &&
-            (oldEventId == 0 || m_panelRows[i].Program.EventID == oldEventId)) {
-            selectIndex = static_cast<int>(i);
-        }
-        if (topIndex < 0 && oldTopChannelKey != 0 && m_panelRows[i].ChannelKey == oldTopChannelKey &&
-            m_panelRows[i].IsFuture == oldTopWasFuture &&
-            (oldTopEventId == 0 || m_panelRows[i].Program.EventID == oldTopEventId)) {
-            topIndex = static_cast<int>(i);
-        }
-    }
-
-    if (topIndex >= 0) {
-        SendMessageW(m_panelList, LB_SETTOPINDEX, static_cast<WPARAM>(topIndex), 0);
-    }
-    if (selectIndex >= 0) {
-        SendMessageW(m_panelList, LB_SETCURSEL, static_cast<WPARAM>(selectIndex), 0);
-    } else {
-        SendMessageW(m_panelList, LB_SETCURSEL, static_cast<WPARAM>(-1), 0);
-    }
-
-    SendMessageW(m_panelList, WM_SETREDRAW, TRUE, 0);
-    RedrawWindow(m_panelList, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE);
+    const auto identityAt = [&](size_t i) -> ViewReservationUi::PanelViewportRowIdentity {
+        const auto &row = m_panelRows[i];
+        return {row.ChannelKey, row.Program.EventID, row.IsFuture};
+    };
+    const int selectIndex = sameWave
+        ? ViewReservationUi::FindPanelViewportRow(m_panelRows.size(),
+            {oldChannelKey, oldEventId, oldSelectionWasFuture}, oldSelection, identityAt) : -1;
+    int topIndex = sameWave
+        ? ViewReservationUi::FindPanelViewportRow(m_panelRows.size(),
+            {oldTopChannelKey, oldTopEventId, oldTopWasFuture}, oldTopIndex, identityAt) : -1;
+    if (topIndex < 0 && sameWave && oldTopIndex >= 0 && !m_panelRows.empty())
+        topIndex = (std::min)(oldTopIndex, static_cast<int>(m_panelRows.size()) - 1);
+    m_panelSelectedRow = selectIndex;
+    const auto refreshedGeometry = GetPanelViewportGeometry();
+    SetPanelViewportScrollY(refreshedGeometry.RestoreAnchor(oldAnchor, topIndex));
+    InvalidateRect(m_panelViewport, nullptr, FALSE);
     if (showStatus) {
         ShowWindow(m_panelStatus, SW_HIDE);
     }
 }
 
+void CViewReservationPlugin::RefreshPanelDisplay(bool forceDriverCache) {
+    RefreshPanelRows(forceDriverCache);
+    UpdateAutomationControls();
+    UpdatePanelViewingProjection(false);
+}
+
 void CViewReservationPlugin::SetPanelWave(PanelWave wave) {
     if (wave == m_panelWave) {
+        UpdatePanelViewingProjection(true);
         return;
     }
     m_panelWave = wave;
+    m_panelWheelRemainder = 0;
     m_panelHoverRow = -1;
     m_panelMarqueeActive = false;
     m_panelMouseTracking = false;
@@ -993,11 +1410,9 @@ void CViewReservationPlugin::SetPanelWave(PanelWave wave) {
         KillTimer(m_panelWindow, kPanelMarqueeDelayTimerId);
     }
     m_panelMarqueeEpochTick = GetTickMs();
-    for (const int id : { kControlWaveGr, kControlWaveBs, kControlWaveCs, kControlWaveCatv }) {
-        HWND button = m_panelWindow != nullptr ? GetDlgItem(m_panelWindow, id) : nullptr;
-        if (button != nullptr) InvalidateRect(button, nullptr, FALSE);
-    }
+    if (m_panelHeader != nullptr) InvalidateRect(m_panelHeader, nullptr, FALSE);
     RefreshPanelRows(false);
+    UpdatePanelViewingProjection(true);
 }
 
 void CViewReservationPlugin::TogglePanelChannelExpanded(size_t rowIndex) {
@@ -1014,9 +1429,7 @@ void CViewReservationPlugin::TogglePanelChannelExpanded(size_t rowIndex) {
     if (!wasExpanded) {
         m_panelExpandedChannels.insert(row.ChannelKey);
     }
-    if (m_panelList != nullptr) {
-        SendMessageW(m_panelList, LB_SETCURSEL, static_cast<WPARAM>(-1), 0);
-    }
+    m_panelSelectedRow = -1;
     m_panelHoverRow = -1;
     m_panelMarqueeActive = false;
     m_panelMouseTracking = false;
@@ -1069,16 +1482,12 @@ void CViewReservationPlugin::ShowPanelReservationMenu(size_t rowIndex, POINT scr
         return;
     }
 
-    bool reserved = false;
-    bool recordReserved = false;
-    for (const auto &existing : m_manager->Snapshot()) {
-        if (MatchesProgramIdentity(existing, row.Program.NetworkID, row.Program.TransportStreamID,
-                row.Program.ServiceID, row.Program.EventID)) {
-            reserved = true;
-            recordReserved = existing.RecordOnTrigger;
-            break;
-        }
-    }
+    const auto reservations = m_manager->Snapshot();
+    const ReservationItem *existingReservation = FindMatchingReservation(
+        reservations, row.Program.NetworkID, row.Program.TransportStreamID,
+        row.Program.ServiceID, row.Program.EventID);
+    const bool reserved = existingReservation != nullptr;
+    const bool recordReserved = reserved && existingReservation->RecordOnTrigger;
 
     HMENU menu = CreatePopupMenu();
     if (menu == nullptr) {
@@ -1111,7 +1520,7 @@ void CViewReservationPlugin::ShowPanelReservationMenu(size_t rowIndex, POINT scr
     } else if (command == kRemoveReservation) {
         RemovePanelReservation(row.Program);
     }
-    InvalidateRect(m_panelList, nullptr, FALSE);
+    InvalidateRect(m_panelViewport, nullptr, FALSE);
 }
 
 void CViewReservationPlugin::ActivatePanelCurrentProgram(size_t rowIndex) {
@@ -1137,65 +1546,216 @@ void CViewReservationPlugin::ActivatePanelCurrentProgram(size_t rowIndex) {
         item.EventName = row.Channel.ChannelName;
     }
 
-    TrySwitchToItem(item, L"視聴");
+    StopZapping();
+    std::lock_guard<std::mutex> operationLock(m_zappingOperationMutex);
+    if (TrySwitchToItem(item, L"視聴"))
+        PostPanelUiStateRefresh(true);
 }
 
-void CViewReservationPlugin::DrawPanelWaveButton(const DRAWITEMSTRUCT *draw) const {
-    if (draw == nullptr) return;
+ViewReservationUi::PanelWaveBarLayout CViewReservationPlugin::GetPanelHeaderLayout() const {
+    RECT client{};
+    if (m_panelHeader != nullptr) GetClientRect(m_panelHeader, &client);
+    return ViewReservationUi::PanelWaveBarLayout::Calculate(
+        static_cast<int>(client.right - client.left), 0, kPanelHeaderGap,
+        kPanelHeaderHeight, m_panelCatvAvailable);
+}
 
-    const RECT paintRect = GetClippedPaintRect(draw->hDC, draw->rcItem);
-    BufferedPaintSurface surface(draw->hDC, paintRect);
-    HDC dc = surface.Get();
+int CViewReservationPlugin::PanelHeaderCommand(ViewReservationUi::PanelWaveBarLayout::Item item) {
+    using Item = ViewReservationUi::PanelWaveBarLayout::Item;
+    switch (item) {
+    case Item::Terrestrial: return kControlWaveGr;
+    case Item::Bs: return kControlWaveBs;
+    case Item::Cs: return kControlWaveCs;
+    case Item::Catv: return kControlWaveCatv;
+    case Item::Refresh: return kControlRefresh;
+    case Item::Power: return kControlPower;
+    default: return 0;
+    }
+}
 
+void CViewReservationPlugin::DrawPanelHeader(HDC dc, const RECT &client) const {
+    const PanelHostPalette palette = ResolvePanelHostPalette(m_pApp);
+    FillSolid(dc, client, palette.Back);
+    const auto layout = GetPanelHeaderLayout();
+    for (const auto item : ViewReservationUi::PanelWaveBarLayout::Items) {
+        const auto segment = layout.Get(item);
+        if (segment.Width <= 0) continue;
+        RECT bounds{segment.X, 0, segment.X + segment.Width, kPanelHeaderHeight};
+        const int saved = SaveDC(dc);
+        IntersectClipRect(dc, bounds.left, bounds.top, bounds.right, bounds.bottom);
+        DrawPanelHeaderItem(dc, bounds, item);
+        if (GetFocus() == m_panelHeader && item == m_panelHeaderFocused) {
+            RECT focus = bounds;
+            InflateRect(&focus, -2, -2);
+            if (focus.right > focus.left && focus.bottom > focus.top) DrawFocusRect(dc, &focus);
+        }
+        if (saved != 0) RestoreDC(dc, saved);
+    }
+}
+
+void CViewReservationPlugin::DrawPanelHeaderItem(
+    HDC dc, const RECT &rect, ViewReservationUi::PanelWaveBarLayout::Item item) const {
+    using Item = ViewReservationUi::PanelWaveBarLayout::Item;
+    const bool isPower = item == Item::Power;
+    const bool isRefresh = item == Item::Refresh;
+    const bool isAction = isPower || isRefresh;
     PanelWave wave = PanelWave::Terrestrial;
     const wchar_t *label = L"";
-    if (draw->CtlID == kControlWaveGr) {
-        wave = PanelWave::Terrestrial;
-        label = L"地上波";
-    } else if (draw->CtlID == kControlWaveBs) {
-        wave = PanelWave::Bs;
-        label = L"BS";
-    } else if (draw->CtlID == kControlWaveCs) {
-        wave = PanelWave::Cs;
-        label = L"CS";
-    } else if (draw->CtlID == kControlWaveCatv) {
-        wave = PanelWave::Catv;
-        label = L"CATV";
-    } else {
-        return;
+    switch (item) {
+    case Item::Terrestrial: label = L"地上波"; break;
+    case Item::Bs: wave = PanelWave::Bs; label = L"BS"; break;
+    case Item::Cs: wave = PanelWave::Cs; label = L"CS"; break;
+    case Item::Catv: wave = PanelWave::Catv; label = L"CATV"; break;
+    case Item::Refresh: case Item::Power: break;
+    default: return;
     }
 
-    auto themeColor = [&](LPCWSTR name, COLORREF fallback) {
-        const COLORREF value = m_pApp != nullptr ? m_pApp->GetColor(name) : CLR_INVALID;
-        return value == CLR_INVALID ? fallback : value;
-    };
-    const COLORREF panelBack = themeColor(L"PanelBack", GetSysColor(COLOR_BTNFACE));
-    const COLORREF panelText = themeColor(L"PanelText", GetSysColor(COLOR_BTNTEXT));
-    const COLORREF tab1 = themeColor(L"PanelTabBack", GetSysColor(COLOR_HIGHLIGHT));
-    const COLORREF tab2 = themeColor(L"PanelTabBack2", tab1);
-    const COLORREF tabText = themeColor(L"PanelTabText", panelText);
-    const COLORREF border = themeColor(L"PanelTabBorder", panelText);
-    const bool active = wave == m_panelWave;
+    const PanelHostPalette palette = ResolvePanelHostPalette(m_pApp);
+    const COLORREF panelBack = palette.Back;
+    const COLORREF panelText = palette.Text;
+    const COLORREF tab1 = palette.TabBack;
+    const COLORREF tab2 = palette.TabBack2;
+    const COLORREF tabText = palette.TabText;
+    const COLORREF border = palette.Border;
+    const bool active = !isAction && wave == m_panelWave;
 
     if (active) {
-        FillVerticalGradient(dc, draw->rcItem, tab1, tab2);
+        FillVerticalGradient(dc, rect, tab1, tab2);
     } else {
-        FillSolid(dc, draw->rcItem, MixColor(panelBack, tab1, 8));
+        FillSolid(dc, rect, MixColor(panelBack, tab1, 8));
     }
 
-    RECT edge = draw->rcItem;
+    if (isAction) {
+        const COLORREF actionBack = MixColor(panelBack, tab1, 8);
+        const COLORREF iconColor = GetPanelIndicatorColor(actionBack, panelText);
+        DrawPanelGlyph(dc, rect,
+            isPower ? ViewReservationUi::PanelGlyph::Power : ViewReservationUi::PanelGlyph::Refresh,
+            iconColor, actionBack);
+    }
+
+    // Draw the shared button border last so the full DIB never erases it.
+    RECT edge = rect;
     HBRUSH brush = CreateSolidBrush(MixColor(border, panelBack, 25));
     if (brush != nullptr) {
         FrameRect(dc, &edge, brush);
         DeleteObject(brush);
     }
+    if (isAction) return;
 
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, active ? tabText : panelText);
-    HFONT font = reinterpret_cast<HFONT>(SendMessageW(draw->hwndItem, WM_GETFONT, 0, 0));
+    HFONT font = m_panelFont != nullptr ? m_panelFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     HGDIOBJ oldFont = font != nullptr ? SelectObject(dc, font) : nullptr;
-    RECT text = draw->rcItem;
-    DrawTextW(dc, label, -1, &text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    RECT text = rect;
+    if (text.right - text.left >= 12)
+        DrawTextW(dc, label, -1, &text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    if (oldFont != nullptr) SelectObject(dc, oldFont);
+}
+
+void CViewReservationPlugin::DrawAutomationBar(HDC dc) const {
+    if (dc == nullptr || m_panelAutomationBar == nullptr) return;
+
+    RECT rc{};
+    GetClientRect(m_panelAutomationBar, &rc);
+    const auto layout = CalculateAutomationBarLayout(dc);
+
+    const PanelHostPalette palette = ResolvePanelHostPalette(m_pApp);
+    const COLORREF panelBack = palette.Back;
+    const COLORREF panelText = palette.Text;
+    const COLORREF tabBack = palette.TabBack;
+    const COLORREF tabText = palette.TabText;
+    const COLORREF border = palette.Border;
+
+    FillSolid(dc, rc, panelBack);
+
+    RECT separator = rc;
+    separator.bottom = (std::min)(separator.bottom, separator.top + 1);
+    FillSolid(dc, separator, MixColor(panelText, panelBack, 82));
+
+    if (!layout.ExitSeparator.Empty()) {
+        FillSolid(dc, ToWinRect(layout.ExitSeparator), MixColor(panelText, panelBack, 76));
+    }
+
+    bool zappingActive = false;
+    bool exitActive = false;
+    int exitHours = ViewReservationSettings::DefaultExitTimerHours;
+    ULONGLONG exitDeadlineTick = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        zappingActive = m_zappingActive;
+        exitActive = m_exitTimerActive;
+        exitHours = m_exitTimerHours;
+        exitDeadlineTick = m_exitDeadlineTick;
+    }
+
+    int displayHours = exitHours;
+    if (exitActive) {
+        constexpr ULONGLONG kHourMs = 60ULL * 60ULL * 1000ULL;
+        const ULONGLONG now = GetTickMs();
+        const ULONGLONG remaining = exitDeadlineTick > now ? exitDeadlineTick - now : 0;
+        displayHours = static_cast<int>((remaining + kHourMs - 1) / kHourMs);
+        displayHours = (std::max)(ViewReservationSettings::ExitTimerMinHours, (std::min)(ViewReservationSettings::ExitTimerMaxHours, displayHours));
+    }
+
+    HFONT font = m_panelAutomationFont != nullptr
+        ? m_panelAutomationFont
+        : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    HGDIOBJ oldFont = font != nullptr ? SelectObject(dc, font) : nullptr;
+    SetBkMode(dc, TRANSPARENT);
+
+    auto drawText = [&](const ViewReservationUi::Rect &layoutRect, const wchar_t *label, COLORREF color, UINT format) {
+        if (layoutRect.Empty() || label == nullptr) return;
+        RECT textRect = ToWinRect(layoutRect);
+        SetTextColor(dc, color);
+        DrawTextW(dc, label, -1, &textRect, format | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    };
+
+    auto drawButton = [&](const ViewReservationUi::Rect &layoutRect, const wchar_t *label, bool active, bool enabled) {
+        if (layoutRect.Empty()) return;
+        const RECT rect = ToWinRect(layoutRect);
+        const COLORREF buttonBack = active
+            ? MixColor(panelBack, tabBack, 26)
+            : MixColor(panelBack, tabBack, 5);
+        FillSolid(dc, rect, buttonBack);
+        HBRUSH brush = CreateSolidBrush(MixColor(border, panelBack, active ? 38 : 62));
+        if (brush != nullptr) {
+            FrameRect(dc, &rect, brush);
+            DeleteObject(brush);
+        }
+        const COLORREF textColor = !enabled
+            ? MixColor(panelText, panelBack, 58)
+            : (active ? tabText : MixColor(panelText, panelBack, 8));
+        drawText(layoutRect, label, textColor, DT_CENTER);
+    };
+
+    if (layout.ShowLabels()) {
+        drawText(layout.ZappingLabel, L"ザッピング", MixColor(panelText, panelBack, 18), DT_LEFT);
+        drawText(layout.ExitLabel, L"終了", MixColor(panelText, panelBack, 18), DT_LEFT);
+    }
+
+    if (layout.ShowStatus() && !layout.ZappingStatus.Empty()) {
+        const RECT pill = ToWinRect(layout.ZappingStatus);
+        const COLORREF fill = zappingActive ? MixColor(panelBack, tabBack, 20) : MixColor(panelBack, panelText, 6);
+        const COLORREF edge = zappingActive ? MixColor(border, panelBack, 42) : MixColor(border, panelBack, 62);
+        HBRUSH fillBrush = CreateSolidBrush(fill);
+        HPEN pen = CreatePen(PS_SOLID, 1, edge);
+        HGDIOBJ oldBrush = fillBrush != nullptr ? SelectObject(dc, fillBrush) : nullptr;
+        HGDIOBJ oldPen = pen != nullptr ? SelectObject(dc, pen) : nullptr;
+        RoundRect(dc, pill.left, pill.top, pill.right, pill.bottom,
+            pill.bottom - pill.top, pill.bottom - pill.top);
+        if (oldPen != nullptr) SelectObject(dc, oldPen);
+        if (oldBrush != nullptr) SelectObject(dc, oldBrush);
+        if (pen != nullptr) DeleteObject(pen);
+        if (fillBrush != nullptr) DeleteObject(fillBrush);
+        drawText(layout.ZappingStatus, zappingActive ? L"巡回中" : L"停止中",
+            zappingActive ? MixColor(panelText, tabBack, 8) : MixColor(panelText, panelBack, 10), DT_CENTER);
+    }
+
+    drawButton(layout.ZappingToggle, zappingActive ? L"停止" : L"開始", zappingActive, true);
+    const std::wstring hourText = std::to_wstring(displayHours) + (exitActive ? L"h" : L"h▼");
+    drawButton(layout.ExitHours, hourText.c_str(), false, !exitActive);
+    drawButton(layout.ExitToggle, exitActive ? L"停止" : L"開始", exitActive, true);
+
     if (oldFont != nullptr) SelectObject(dc, oldFont);
 }
 
@@ -1266,56 +1826,54 @@ void CViewReservationPlugin::ResetPanelMarqueeForLayoutChange() {
     }
 }
 
-void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
-    if (draw == nullptr || draw->itemID == static_cast<UINT>(-1) ||
-        static_cast<size_t>(draw->itemID) >= m_panelRows.size()) {
-        return;
+void CViewReservationPlugin::DrawPanelRow(HDC dc, const RECT &rowRect,
+    const ViewReservationUi::PanelViewportGeometry &geometry, size_t rowIndex) const {
+    if (dc == nullptr || rowIndex >= m_panelRows.size()) return;
+
+    const PanelRow &row = m_panelRows[rowIndex];
+
+    const PanelHostPalette palette = ResolvePanelHostPalette(m_pApp);
+    const COLORREF panelBack = palette.Back;
+    const COLORREF panelText = palette.Text;
+    const COLORREF accentTop = palette.TabBack;
+    const COLORREF border = palette.Border;
+
+    // 選択操作とは独立して実際の視聴状態を描画する。
+    // 実際のTVTest選局状態だけを正本に、通常視聴とザッピングを色分けする。
+    ViewReservationUi::PanelStationEmphasis emphasis = ViewReservationUi::PanelStationEmphasis::None;
+    if (!row.IsFuture && m_panelViewingProjection.HasCurrentService &&
+        m_panelViewingProjection.Wave == m_panelWave &&
+        m_panelViewingProjection.ChannelKey == row.ChannelKey) {
+        emphasis = m_panelViewingProjection.Emphasis;
     }
-
-    const RECT paintRect = GetClippedPaintRect(draw->hDC, draw->rcItem);
-    BufferedPaintSurface surface(draw->hDC, paintRect);
-    HDC dc = surface.Get();
-
-    const PanelRow &row = m_panelRows[draw->itemID];
-    const bool selected = (draw->itemState & ODS_SELECTED) != 0;
-
-    auto themeColor = [&](LPCWSTR name, COLORREF fallback) {
-        const COLORREF value = m_pApp != nullptr ? m_pApp->GetColor(name) : CLR_INVALID;
-        return value == CLR_INVALID ? fallback : value;
-    };
-    const COLORREF panelBack = themeColor(L"PanelBack", GetSysColor(COLOR_WINDOW));
-    const COLORREF panelText = themeColor(L"PanelText", GetSysColor(COLOR_WINDOWTEXT));
-    const COLORREF accentTop = themeColor(L"PanelTabBack", GetSysColor(COLOR_HIGHLIGHT));
-    const COLORREF accentBottom = themeColor(L"PanelTabBack2", accentTop);
-    const COLORREF accentText = themeColor(L"PanelTabText", panelText);
-    const COLORREF border = themeColor(L"PanelTabBorder", MixColor(panelText, panelBack, 55));
 
     COLORREF rowBack = panelBack;
-    if (selected) {
-        FillVerticalGradient(dc, draw->rcItem, accentTop, accentBottom);
-        rowBack = MixColor(accentTop, accentBottom, 50);
+    if (emphasis != ViewReservationUi::PanelStationEmphasis::None) {
+        rowBack = ToColorRef(ViewReservationUi::ResolvePanelStationBackground(emphasis));
+        FillSolid(dc, rowRect, rowBack);
     } else if (row.IsFuture) {
         rowBack = MixColor(panelBack, accentTop, 10);
-        FillSolid(dc, draw->rcItem, rowBack);
+        FillSolid(dc, rowRect, rowBack);
     } else {
-        FillSolid(dc, draw->rcItem, panelBack);
+        FillSolid(dc, rowRect, panelBack);
     }
 
-    const bool darkSurface = m_pApp != nullptr
-        ? m_pApp->IsDarkModeColor(rowBack)
-        : (GetRValue(rowBack) + GetGValue(rowBack) + GetBValue(rowBack) < 384);
-    const PanelSemanticTextColors semantic = GetPanelSemanticTextColors(darkSurface);
-    const COLORREF programText = row.IsFuture ? semantic.FutureProgram : semantic.CurrentProgram;
+    const auto &presentation = ViewReservationUi::kPanelPresentationColors;
+    const COLORREF stationText = ToColorRef(presentation.StationText);
+    const COLORREF timeText = ToColorRef(presentation.TimeText);
+    const COLORREF currentProgramText = ToColorRef(presentation.CurrentProgramText);
+    const COLORREF futureProgramText = ToColorRef(presentation.FutureProgramText);
+    const COLORREF programText = row.IsFuture ? futureProgramText : currentProgramText;
 
     SetBkMode(dc, TRANSPARENT);
-    HFONT font = reinterpret_cast<HFONT>(SendMessageW(m_panelList, WM_GETFONT, 0, 0));
+    HFONT font = m_panelFont != nullptr ? m_panelFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     HGDIOBJ oldFont = nullptr;
     if (font != nullptr) {
         oldFont = SelectObject(dc, font);
     }
 
     // 右端の予約状態列・展開列・時刻列を全描画経路で同じ計算に統一する。
-    const PanelRowLayout layout = CalculatePanelRowLayout(draw->rcItem, dc);
+    const PanelRowLayout layout = CalculatePanelRowLayout(rowRect, dc);
     RECT content = layout.Content;
 
     auto formatTime = [](const ReservationItem &item) {
@@ -1326,7 +1884,7 @@ void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
         ULARGE_INTEGER value{};
         value.LowPart = ft.dwLowDateTime;
         value.HighPart = ft.dwHighDateTime;
-        value.QuadPart += static_cast<ULONGLONG>(item.Duration) * 10000000ULL;
+        value.QuadPart += static_cast<ULONGLONG>(item.Duration) * ViewReservationTime::TicksPerSecond;
         ft.dwLowDateTime = value.LowPart;
         ft.dwHighDateTime = value.HighPart;
         if (!FileTimeToSystemTime(&ft, &end)) return std::wstring{};
@@ -1337,7 +1895,11 @@ void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
 
     TEXTMETRICW tm{};
     GetTextMetricsW(dc, &tm);
-    const int lineHeight = (std::max)(14, static_cast<int>(tm.tmHeight));
+    const int fontHeight = (std::max)(1, static_cast<int>(tm.tmHeight));
+    const int lineHeight = (std::max)(14, fontHeight);
+    const auto wholeTextLine = [&](const RECT &rect) {
+        return geometry.ContainsCenteredLine(rect.top, rect.bottom, lineHeight);
+    };
     const int timeWidth = layout.TimeWidth;
     const int titleStart = layout.TitleLeft;
 
@@ -1346,18 +1908,22 @@ void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
         RECT stationRect = content;
         stationRect.bottom = (std::min)(stationRect.bottom, stationRect.top + lineHeight + 3);
         const std::wstring station = row.Channel.ChannelName.empty() ? L"(局名未取得)" : row.Channel.ChannelName;
-        SetTextColor(dc, semantic.Station);
-        DrawTextW(dc, station.c_str(), -1, &stationRect,
-            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        SetTextColor(dc, stationText);
+        if (wholeTextLine(stationRect)) {
+            DrawTextW(dc, station.c_str(), -1, &stationRect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
 
         RECT second = content;
         second.top = stationRect.bottom;
         const std::wstring time = formatTime(row.Program);
         RECT timeRect = second;
         timeRect.right = (std::min)(second.right, second.left + timeWidth);
-        SetTextColor(dc, semantic.Time);
-        DrawTextW(dc, time.c_str(), -1, &timeRect,
-            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        SetTextColor(dc, timeText);
+        if (wholeTextLine(timeRect)) {
+            DrawTextW(dc, time.c_str(), -1, &timeRect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        }
         titleRect = second;
         titleRect.left = titleStart;
     } else {
@@ -1367,16 +1933,18 @@ void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
         const std::wstring time = formatTime(row.Program);
         RECT timeRect = content;
         timeRect.right = (std::min)(content.right, timeRect.left + timeWidth);
-        SetTextColor(dc, semantic.Time);
-        DrawTextW(dc, time.c_str(), -1, &timeRect,
-            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        SetTextColor(dc, timeText);
+        if (wholeTextLine(timeRect)) {
+            DrawTextW(dc, time.c_str(), -1, &timeRect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        }
         titleRect = content;
         titleRect.left = titleStart;
     }
 
     const std::wstring &title = row.Program.EventName;
     row.NeedsMarquee = false;
-    if (!title.empty() && titleRect.right > titleRect.left) {
+    if (!title.empty() && titleRect.right > titleRect.left && wholeTextLine(titleRect)) {
         SetTextColor(dc, programText);
         SIZE size{};
         GetTextExtentPoint32W(dc, title.c_str(), static_cast<int>(title.size()), &size);
@@ -1389,12 +1957,12 @@ void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
         if (titlePixelWidth <= available) {
             ExtTextOutW(dc, titleRect.left, y, ETO_CLIPPED, &clip,
                 title.c_str(), static_cast<UINT>(title.size()), nullptr);
-        } else if (static_cast<int>(draw->itemID) == m_panelHoverRow && !m_panelMarqueeActive) {
+        } else if (static_cast<int>(rowIndex) == m_panelHoverRow && !m_panelMarqueeActive) {
             // ホバー待機中は通常位置の全文をそのままクリップ表示する。
             // 省略記号付き表示から移動描画へ直接切り替えず、開始位置を連続させる。
             ExtTextOutW(dc, titleRect.left, y, ETO_CLIPPED, &clip,
                 title.c_str(), static_cast<UINT>(title.size()), nullptr);
-        } else if (static_cast<int>(draw->itemID) == m_panelHoverRow && m_panelMarqueeActive) {
+        } else if (static_cast<int>(rowIndex) == m_panelHoverRow && m_panelMarqueeActive) {
             // 見切れタイトルはホバー中の1行だけ、右から左へ滑らかに循環する。
             const int gap = (std::max)(28, available / 3);
             const int travel = (std::max)(1, titlePixelWidth + gap);
@@ -1422,78 +1990,163 @@ void CViewReservationPlugin::DrawPanelRow(const DRAWITEMSTRUCT *draw) const {
     if (row.ReservationKind != PanelReservationKind::None) {
         RECT reservationRect = layout.Reservation;
         const bool recordReserved = row.ReservationKind == PanelReservationKind::Record;
-        const COLORREF reservationColor = darkSurface
-            ? (recordReserved ? RGB(255, 105, 105) : RGB(105, 200, 255))
-            : (recordReserved ? RGB(190, 45, 45) : RGB(0, 105, 180));
+        const COLORREF reservationColor = ToColorRef(
+            ViewReservationUi::ResolvePanelReservationMarkColor(recordReserved));
         SetTextColor(dc, reservationColor);
         const wchar_t *reservationMark = recordReserved ? L"●" : L"▶";
-        DrawTextW(dc, reservationMark, -1, &reservationRect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        if (wholeTextLine(reservationRect)) {
+            DrawTextW(dc, reservationMark, -1, &reservationRect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
         SetTextColor(dc, programText);
     }
 
     if (!row.IsFuture && row.HasFuture) {
-        RECT arrowRect = layout.Arrow;
         const bool expanded = m_panelExpandedChannels.find(row.ChannelKey) != m_panelExpandedChannels.end();
-        const COLORREF arrowBack = expanded ? MixColor(accentTop, accentBottom, 50) : MixColor(panelBack, accentTop, 18);
-        FillSolid(dc, arrowRect, arrowBack);
-        SetTextColor(dc, expanded ? accentText : panelText);
-        const wchar_t *arrow = expanded ? L"△" : L"▽";
-        DrawTextW(dc, arrow, -1, &arrowRect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        const COLORREF arrowColor = GetPanelIndicatorColor(rowBack, panelText);
+        if (geometry.ContainsCenteredLine(layout.Arrow.top, layout.Arrow.bottom,
+            ViewReservationUi::kPanelGlyphCanvasSide)) {
+            DrawPanelGlyph(dc, layout.Arrow,
+                expanded ? ViewReservationUi::PanelGlyph::ChevronUp
+                         : ViewReservationUi::PanelGlyph::ChevronDown,
+                arrowColor, rowBack);
+        }
         SetTextColor(dc, programText);
     }
 
-    RECT separator = draw->rcItem;
+    RECT separator = rowRect;
     separator.top = separator.bottom - 1;
     const bool expandedHeader = !row.IsFuture
         && m_panelExpandedChannels.find(row.ChannelKey) != m_panelExpandedChannels.end();
-    FillSolid(dc, separator, MixColor(border, panelBack, expandedHeader ? 68 : 35));
+    FillSolid(dc, separator, MixColor(border, rowBack, expandedHeader ? 68 : 35));
 
     if (oldFont != nullptr) {
         SelectObject(dc, oldFont);
     }
 }
 
-LRESULT CALLBACK CViewReservationPlugin::PanelListProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    auto *self = reinterpret_cast<CViewReservationPlugin*>(GetPropW(hwnd, L"ViewReservation.PanelSelf"));
-    if (self == nullptr || self->m_panelListOriginalProc == nullptr) {
-        return DefWindowProcW(hwnd, message, wParam, lParam);
+LRESULT CALLBACK CViewReservationPlugin::PanelViewportProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto *self = reinterpret_cast<CViewReservationPlugin*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto *create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        self = static_cast<CViewReservationPlugin*>(create->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
     }
+    if (self == nullptr) return DefWindowProcW(hwnd, message, wParam, lParam);
 
-    if (message == WM_ERASEBKGND) {
-        HDC dc = reinterpret_cast<HDC>(wParam);
-        RECT rc{};
-        GetClientRect(hwnd, &rc);
-        COLORREF back = self->m_pApp != nullptr ? self->m_pApp->GetColor(L"PanelBack") : CLR_INVALID;
-        if (back == CLR_INVALID) back = GetSysColor(COLOR_WINDOW);
-        FillSolid(dc, rc, back);
+    switch (message) {
+    case WM_ERASEBKGND:
         return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(hwnd, &paint);
+        if (dc != nullptr) {
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            const RECT dirty = paint.rcPaint;
+            BufferedPaintSurface surface(dc, dirty);
+            HDC target = surface.Get();
+            FillSolid(target, dirty, ResolvePanelHostPalette(self->m_pApp).Back);
+            const int savedDc = SaveDC(target);
+            IntersectClipRect(target, dirty.left, dirty.top, dirty.right, dirty.bottom);
+            const auto geometry = self->GetPanelViewportGeometry();
+            geometry.ForEachVisible([&](int index, int y, int height) {
+                RECT rowRect{client.left, y, client.right, y + height};
+                RECT overlap{};
+                if (!IntersectRect(&overlap, &rowRect, &dirty)) return;
+                self->DrawPanelRow(target, rowRect, geometry, static_cast<size_t>(index));
+            });
+            if (savedDc != 0) RestoreDC(target, savedDc);
+        }
+        EndPaint(hwnd, &paint);
+        return 0;
     }
-
-    if (message == WM_MOUSEMOVE) {
+    case WM_VSCROLL: {
+        int top = self->m_panelViewportScrollY;
+        const auto geometry = self->GetPanelViewportGeometry();
+        using ScrollAction = ViewReservationUi::PanelViewportGeometry::ScrollAction;
+        switch (LOWORD(wParam)) {
+        case SB_LINEUP: top = geometry.Scroll(ScrollAction::Line, -1); break;
+        case SB_LINEDOWN: top = geometry.Scroll(ScrollAction::Line, 1); break;
+        case SB_PAGEUP: top = geometry.Scroll(ScrollAction::Page, -1); break;
+        case SB_PAGEDOWN: top = geometry.Scroll(ScrollAction::Page, 1); break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION: {
+            SCROLLINFO info{};
+            info.cbSize = sizeof(info);
+            info.fMask = SIF_TRACKPOS;
+            if (GetScrollInfo(hwnd, SB_VERT, &info)) top = geometry.Scroll(ScrollAction::Absolute, info.nTrackPos);
+            break;
+        }
+        case SB_TOP: top = geometry.Scroll(ScrollAction::Top); break;
+        case SB_BOTTOM: top = geometry.Scroll(ScrollAction::Bottom); break;
+        default: return 0;
+        }
+        if (top != self->m_panelViewportScrollY) self->m_panelSelectedRow = -1;
+        self->SetPanelViewportScrollY(top);
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        const UINT lines = [] { UINT value = 3; SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &value, 0); return value; }();
+        if (lines == 0) return 0;
+        self->m_panelWheelRemainder += GET_WHEEL_DELTA_WPARAM(wParam);
+        const int steps = self->m_panelWheelRemainder / WHEEL_DELTA;
+        self->m_panelWheelRemainder %= WHEEL_DELTA;
+        if (steps != 0) {
+            const auto geometry = self->GetPanelViewportGeometry();
+            using ScrollAction = ViewReservationUi::PanelViewportGeometry::ScrollAction;
+            const int next = lines == WHEEL_PAGESCROLL
+                ? geometry.Scroll(ScrollAction::Page, -steps)
+                : geometry.Scroll(ScrollAction::Line,
+                    static_cast<int>((std::max)(static_cast<int64_t>((std::numeric_limits<int>::min)()),
+                        (std::min)(-static_cast<int64_t>(steps) * lines,
+                            static_cast<int64_t>((std::numeric_limits<int>::max)())))));
+            if (next != self->m_panelViewportScrollY) self->m_panelSelectedRow = -1;
+            self->SetPanelViewportScrollY(next);
+        }
+        return 0;
+    }
+    case WM_KEYDOWN: {
+        if (self->m_panelRows.empty()) return 0;
+        const auto geometry = self->GetPanelViewportGeometry();
+        using ScrollAction = ViewReservationUi::PanelViewportGeometry::ScrollAction;
+        int current = self->m_panelSelectedRow;
+        if (current < 0 || current >= geometry.RowCount() ||
+            !geometry.RowRect(current, nullptr, nullptr))
+            current = geometry.IndexAtOffset(geometry.ScrollY);
+        int next = current;
+        int nextScroll = geometry.ScrollY;
+        switch (wParam) {
+        case VK_UP: next = (std::max)(0, current - 1); nextScroll = geometry.Scroll(ScrollAction::Reveal, next); break;
+        case VK_DOWN: next = (std::min)(geometry.RowCount() - 1, current + 1); nextScroll = geometry.Scroll(ScrollAction::Reveal, next); break;
+        case VK_PRIOR: nextScroll = geometry.Scroll(ScrollAction::Page, -1); next = geometry.IndexAtOffset(nextScroll); break;
+        case VK_NEXT: nextScroll = geometry.Scroll(ScrollAction::Page, 1); next = geometry.IndexAtOffset(nextScroll); break;
+        case VK_HOME: next = 0; nextScroll = geometry.Scroll(ScrollAction::Top); break;
+        case VK_END: next = geometry.RowCount() - 1; nextScroll = geometry.Scroll(ScrollAction::Bottom); break;
+        case VK_RETURN:
+            if (!self->m_panelRows[static_cast<size_t>(current)].IsFuture)
+                self->ActivatePanelCurrentProgram(static_cast<size_t>(current));
+            return 0;
+        default: return DefWindowProcW(hwnd, message, wParam, lParam);
+        }
+        self->m_panelSelectedRow = next;
+        self->SetPanelViewportScrollY(nextScroll);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
         if (!self->m_panelMouseTracking) {
             TRACKMOUSEEVENT track{};
             track.cbSize = sizeof(track);
             track.dwFlags = TME_LEAVE;
             track.hwndTrack = hwnd;
-            if (TrackMouseEvent(&track)) {
-                self->m_panelMouseTracking = true;
-            }
+            if (TrackMouseEvent(&track)) self->m_panelMouseTracking = true;
         }
-
-        POINT pt{ static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
-        const LRESULT hit = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, MAKELPARAM(pt.x, pt.y));
-        int hover = -1;
-        if (HIWORD(hit) == 0) {
-            const int index = LOWORD(hit);
-            if (index >= 0 && static_cast<size_t>(index) < self->m_panelRows.size()) {
-                hover = index;
-            }
-        }
-
+        const POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const int hover = PtInRect(&client, pt) ? self->GetPanelViewportGeometry().HitTest(pt.y) : -1;
         if (hover != self->m_panelHoverRow) {
-            const int oldHover = self->m_panelHoverRow;
+            const int previous = self->m_panelHoverRow;
             self->m_panelHoverRow = hover;
             self->m_panelMarqueeActive = false;
             self->m_panelMarqueeEpochTick = GetTickMs();
@@ -1501,29 +2154,17 @@ LRESULT CALLBACK CViewReservationPlugin::PanelListProc(HWND hwnd, UINT message, 
                 KillTimer(self->m_panelWindow, kPanelMarqueeTimerId);
                 KillTimer(self->m_panelWindow, kPanelMarqueeDelayTimerId);
             }
-
-            auto invalidateRow = [&](int index) {
-                if (index < 0 || static_cast<size_t>(index) >= self->m_panelRows.size()) return;
-                RECT item{};
-                if (SendMessageW(hwnd, LB_GETITEMRECT, static_cast<WPARAM>(index), reinterpret_cast<LPARAM>(&item)) != LB_ERR) {
-                    InvalidateRect(hwnd, &item, FALSE);
-                }
-            };
-            invalidateRow(oldHover);
-            invalidateRow(hover);
-
+            self->InvalidatePanelViewportRow(previous);
+            self->InvalidatePanelViewportRow(hover);
             if (self->m_panelWindow != nullptr && hover >= 0 &&
-                static_cast<size_t>(hover) < self->m_panelRows.size() &&
                 self->m_panelRows[static_cast<size_t>(hover)].NeedsMarquee) {
-                // マウスが横切っただけでは動かさず、一定時間留まった行だけマーキーを開始する。
                 SetTimer(self->m_panelWindow, kPanelMarqueeDelayTimerId, kPanelMarqueeHoverDelayMs, nullptr);
             }
         }
-        return CallWindowProcW(self->m_panelListOriginalProc, hwnd, message, wParam, lParam);
+        return 0;
     }
-
-    if (message == WM_MOUSELEAVE) {
-        const int oldHover = self->m_panelHoverRow;
+    case WM_MOUSELEAVE: {
+        const int previous = self->m_panelHoverRow;
         self->m_panelMouseTracking = false;
         self->m_panelHoverRow = -1;
         self->m_panelMarqueeActive = false;
@@ -1531,49 +2172,233 @@ LRESULT CALLBACK CViewReservationPlugin::PanelListProc(HWND hwnd, UINT message, 
             KillTimer(self->m_panelWindow, kPanelMarqueeTimerId);
             KillTimer(self->m_panelWindow, kPanelMarqueeDelayTimerId);
         }
-        if (oldHover >= 0 && static_cast<size_t>(oldHover) < self->m_panelRows.size()) {
-            RECT item{};
-            if (SendMessageW(hwnd, LB_GETITEMRECT, static_cast<WPARAM>(oldHover), reinterpret_cast<LPARAM>(&item)) != LB_ERR) {
-                InvalidateRect(hwnd, &item, FALSE);
+        self->InvalidatePanelViewportRow(previous);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONUP: {
+        const POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        if (!PtInRect(&client, pt)) return 0;
+        const int index = self->GetPanelViewportGeometry().HitTest(pt.y);
+        if (index < 0) return 0;
+        if (message == WM_LBUTTONDOWN) {
+            SetFocus(hwnd);
+            RECT itemRect{};
+            if (!self->GetPanelViewportRowRect(index, &itemRect)) return 0;
+            const auto &row = self->m_panelRows[static_cast<size_t>(index)];
+            const int arrowLeft = static_cast<int>(itemRect.right) - 4 - kPanelArrowHitWidth;
+            const auto geometry = self->GetPanelViewportGeometry();
+            const int64_t fullRowTop = static_cast<int64_t>(geometry.RowStart(index)) - geometry.ScrollY;
+            const bool arrowVisible = geometry.ContainsCenteredLine(fullRowTop,
+                fullRowTop + geometry.RowHeight(index), ViewReservationUi::kPanelGlyphCanvasSide);
+            if (!row.IsFuture && row.HasFuture && arrowVisible && pt.x >= arrowLeft) {
+                self->TogglePanelChannelExpanded(static_cast<size_t>(index));
+                return 0;
             }
+            self->m_panelSelectedRow = index;
+        } else if (message == WM_LBUTTONDBLCLK) {
+            if (!self->m_panelRows[static_cast<size_t>(index)].IsFuture)
+                self->ActivatePanelCurrentProgram(static_cast<size_t>(index));
+        } else {
+            self->m_panelSelectedRow = index;
+            POINT screen = pt;
+            ClientToScreen(hwnd, &screen);
+            self->ShowPanelReservationMenu(static_cast<size_t>(index), screen);
         }
         return 0;
     }
+    default: break;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
 
-    if (message == WM_LBUTTONDOWN || message == WM_LBUTTONDBLCLK || message == WM_RBUTTONUP) {
-        POINT pt{ static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
-        const LRESULT hit = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, MAKELPARAM(pt.x, pt.y));
-        const int index = LOWORD(hit);
-        const bool outside = HIWORD(hit) != 0;
-        if (!outside && index >= 0 && static_cast<size_t>(index) < self->m_panelRows.size()) {
-            if (message == WM_LBUTTONDOWN) {
-                RECT itemRect{};
-                SendMessageW(hwnd, LB_GETITEMRECT, static_cast<WPARAM>(index), reinterpret_cast<LPARAM>(&itemRect));
-                const auto &row = self->m_panelRows[static_cast<size_t>(index)];
-                // 見た目の▽/△は細いまま、クリック領域だけ広く確保する。
-                const int arrowLeft = static_cast<int>(itemRect.right) - 4 - kPanelArrowHitWidth;
-                if (!row.IsFuture && row.HasFuture && pt.x >= arrowLeft) {
-                    self->TogglePanelChannelExpanded(static_cast<size_t>(index));
-                    return 0;
-                }
-                SendMessageW(hwnd, LB_SETCURSEL, static_cast<WPARAM>(index), 0);
-            } else if (message == WM_LBUTTONDBLCLK) {
-                const auto &row = self->m_panelRows[static_cast<size_t>(index)];
-                if (!row.IsFuture) {
-                    self->ActivatePanelCurrentProgram(static_cast<size_t>(index));
-                    return 0;
-                }
-            } else {
-                SendMessageW(hwnd, LB_SETCURSEL, static_cast<WPARAM>(index), 0);
-                POINT screen = pt;
-                ClientToScreen(hwnd, &screen);
-                self->ShowPanelReservationMenu(static_cast<size_t>(index), screen);
-                return 0;
-            }
-        }
+LRESULT CALLBACK CViewReservationPlugin::AutomationBarProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto *self = reinterpret_cast<CViewReservationPlugin*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+    if (message == WM_NCCREATE) {
+        const auto *cs = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        self = static_cast<CViewReservationPlugin*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        if (self != nullptr) self->m_panelAutomationBar = hwnd;
     }
 
-    return CallWindowProcW(self->m_panelListOriginalProc, hwnd, message, wParam, lParam);
+    if (self == nullptr) {
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+
+    switch (message) {
+    case WM_CREATE:
+        // AutomationBar自身が描画とクリック判定を持つ。子コントロールは作らない。
+        return 0;
+
+    case WM_SIZE:
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(hwnd, &ps);
+        self->DrawAutomationBar(dc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        const int x = static_cast<int>(static_cast<short>(LOWORD(lParam)));
+        const int y = static_cast<int>(static_cast<short>(HIWORD(lParam)));
+
+        HDC dc = GetDC(hwnd);
+        const auto layout = self->CalculateAutomationBarLayout(dc);
+        if (dc != nullptr) {
+            ReleaseDC(hwnd, dc);
+        }
+
+        if (layout.ZappingToggle.Contains(x, y)) {
+            bool active = false;
+            { std::lock_guard<std::mutex> lock(self->m_automationMutex); active = self->m_zappingActive; }
+            if (active) self->StopZapping(); else self->StartZapping();
+            return 0;
+        }
+        if (layout.ExitHours.Contains(x, y)) {
+            bool active = false;
+            { std::lock_guard<std::mutex> lock(self->m_automationMutex); active = self->m_exitTimerActive; }
+            if (!active) self->ShowExitHoursMenu();
+            return 0;
+        }
+        if (layout.ExitToggle.Contains(x, y)) {
+            bool active = false;
+            { std::lock_guard<std::mutex> lock(self->m_automationMutex); active = self->m_exitTimerActive; }
+            if (active) self->StopExitTimer(); else self->StartExitTimer();
+            return 0;
+        }
+        break;
+    }
+
+    case WM_DESTROY:
+        if (self->m_panelAutomationBar == hwnd) self->m_panelAutomationBar = nullptr;
+        return 0;
+    }
+
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+LRESULT CALLBACK CViewReservationPlugin::PanelHeaderProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto *self = reinterpret_cast<CViewReservationPlugin*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto *cs = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        self = static_cast<CViewReservationPlugin*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+    }
+    if (self == nullptr) return DefWindowProcW(hwnd, message, wParam, lParam);
+
+    using Item = ViewReservationUi::PanelWaveBarLayout::Item;
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1; // WM_PAINT supplies the complete background and all segments.
+    case WM_SIZE:
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_GETDLGCODE:
+        return DLGC_WANTARROWS;
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const int width = (std::max)(0, static_cast<int>(client.right - client.left));
+        const int height = (std::max)(0, static_cast<int>(client.bottom - client.top));
+        if (width > 0 && height > 0) {
+            HDC buffer = CreateCompatibleDC(dc);
+            HBITMAP bitmap = buffer != nullptr ? CreateCompatibleBitmap(dc, width, height) : nullptr;
+            if (buffer != nullptr && bitmap != nullptr) {
+                HGDIOBJ old = SelectObject(buffer, bitmap);
+                self->DrawPanelHeader(buffer, client);
+                BitBlt(dc, 0, 0, width, height, buffer, 0, 0, SRCCOPY);
+                SelectObject(buffer, old);
+            } else {
+                self->DrawPanelHeader(dc, client);
+            }
+            if (bitmap != nullptr) DeleteObject(bitmap);
+            if (buffer != nullptr) DeleteDC(buffer);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        const auto item = self->GetPanelHeaderLayout().HitTest(GET_X_LPARAM(lParam));
+        if (item == Item::None || GET_Y_LPARAM(lParam) < 0 || GET_Y_LPARAM(lParam) >= kPanelHeaderHeight) return 0;
+        SetFocus(hwnd); // Explicit user click only; never on a passive refresh.
+        self->m_panelHeaderFocused = item;
+        self->m_panelHeaderPressed = item;
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (GetCapture() != hwnd) return 0;
+        const auto pressed = self->m_panelHeaderPressed;
+        const auto released = self->GetPanelHeaderLayout().HitTest(GET_X_LPARAM(lParam));
+        ReleaseCapture();
+        self->m_panelHeaderPressed = Item::None;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        if (pressed != Item::None && pressed == released &&
+            GET_Y_LPARAM(lParam) >= 0 && GET_Y_LPARAM(lParam) < kPanelHeaderHeight) {
+            const int id = PanelHeaderCommand(pressed);
+            if (id != 0) SendMessageW(GetParent(hwnd), WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), reinterpret_cast<LPARAM>(hwnd));
+        }
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        self->m_panelHeaderPressed = Item::None;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_KEYDOWN: {
+        const auto layout = self->GetPanelHeaderLayout();
+        if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_HOME || wParam == VK_END) {
+            const auto &items = ViewReservationUi::PanelWaveBarLayout::Items;
+            int current = 0;
+            for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+                if (items[static_cast<size_t>(i)] == self->m_panelHeaderFocused) { current = i; break; }
+            }
+            int next = current;
+            if (wParam == VK_HOME) next = 0;
+            if (wParam == VK_END) next = static_cast<int>(items.size()) - 1;
+            const int direction = wParam == VK_LEFT ? -1 : 1;
+            for (int steps = 0; steps < static_cast<int>(items.size()); ++steps) {
+                if (wParam == VK_LEFT || wParam == VK_RIGHT)
+                    next = (next + direction + static_cast<int>(items.size())) % static_cast<int>(items.size());
+                if (layout.Get(items[static_cast<size_t>(next)]).Width > 0) {
+                    self->m_panelHeaderFocused = items[static_cast<size_t>(next)];
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    break;
+                }
+                if (wParam == VK_HOME || wParam == VK_END) next += wParam == VK_HOME ? 1 : -1;
+                if (next < 0 || next >= static_cast<int>(items.size())) break;
+            }
+            return 0;
+        }
+        if (wParam == VK_RETURN || wParam == VK_SPACE) {
+            if (layout.Get(self->m_panelHeaderFocused).Width > 0) {
+                const int id = PanelHeaderCommand(self->m_panelHeaderFocused);
+                if (id != 0) SendMessageW(GetParent(hwnd), WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), reinterpret_cast<LPARAM>(hwnd));
+            }
+            return 0;
+        }
+        break;
+    }
+    case WM_DESTROY:
+        if (self->m_panelHeader == hwnd) self->m_panelHeader = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
 LRESULT CALLBACK CViewReservationPlugin::PanelWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -1591,28 +2416,31 @@ LRESULT CALLBACK CViewReservationPlugin::PanelWindowProc(HWND hwnd, UINT message
 
     switch (message) {
     case WM_CREATE: {
-        const DWORD waveStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW;
-        CreateWindowExW(0, L"BUTTON", L"地上波", waveStyle | WS_GROUP,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlWaveGr)), g_hinstDLL, nullptr);
-        CreateWindowExW(0, L"BUTTON", L"BS", waveStyle,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlWaveBs)), g_hinstDLL, nullptr);
-        CreateWindowExW(0, L"BUTTON", L"CS", waveStyle,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlWaveCs)), g_hinstDLL, nullptr);
-        CreateWindowExW(0, L"BUTTON", L"CATV", waveStyle,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlWaveCatv)), g_hinstDLL, nullptr);
-        HWND catvButton = GetDlgItem(hwnd, kControlWaveCatv);
-        if (catvButton != nullptr) ShowWindow(catvButton, SW_HIDE);
+        self->m_panelHeader = CreateWindowExW(
+            0, kPanelHeaderClassName, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlHeaderBar)), g_hinstDLL, self);
+        if (self->m_panelHeader == nullptr) return -1;
 
-        self->m_panelList = CreateWindowExW(0, L"LISTBOX", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT |
-            LBS_DISABLENOSCROLL | LBS_OWNERDRAWVARIABLE | LBS_HASSTRINGS,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlList)), g_hinstDLL, nullptr);
-
-        if (self->m_panelList != nullptr) {
-            SetPropW(self->m_panelList, L"ViewReservation.PanelSelf", self);
-            self->m_panelListOriginalProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
-                self->m_panelList, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(PanelListProc)));
+        self->m_panelAutomationBar = CreateWindowExW(
+            0,
+            kAutomationBarClassName,
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+            0, 0, 0, 0,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlAutomationBar)),
+            g_hinstDLL,
+            self);
+        if (self->m_panelAutomationBar == nullptr) {
+            return -1;
         }
+
+        self->m_panelViewport = CreateWindowExW(0, kPanelViewportClassName, L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_CLIPCHILDREN,
+            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlViewport)),
+            g_hinstDLL, self);
+        if (self->m_panelViewport == nullptr) return -1;
 
         self->m_panelStatus = CreateWindowExW(0, L"STATIC", L"",
             WS_CHILD | SS_CENTER | SS_CENTERIMAGE | SS_NOPREFIX,
@@ -1620,124 +2448,63 @@ LRESULT CALLBACK CViewReservationPlugin::PanelWindowProc(HWND hwnd, UINT message
 
         self->m_panelMarqueeEpochTick = GetTickMs();
         self->UpdatePanelFont();
+        self->UpdateAutomationControls();
 
-        if (self->m_pApp != nullptr) {
-            const COLORREF panelBack = self->m_pApp->GetColor(L"PanelBack");
-            if (panelBack != CLR_INVALID) {
-                const bool dark = self->m_pApp->IsDarkModeColor(panelBack);
-                self->m_pApp->SetWindowDarkMode(hwnd, dark);
-                if (self->m_panelList != nullptr) self->m_pApp->SetWindowDarkMode(self->m_panelList, dark);
-                if (self->m_panelStatus != nullptr) self->m_pApp->SetWindowDarkMode(self->m_panelStatus, dark);
-            }
-        }
         return 0;
     }
 
-
-    case WM_CTLCOLORLISTBOX: {
-        HWND control = reinterpret_cast<HWND>(lParam);
-        if (control == self->m_panelList) {
-            HDC dc = reinterpret_cast<HDC>(wParam);
-            COLORREF back = self->m_pApp != nullptr ? self->m_pApp->GetColor(L"PanelBack") : CLR_INVALID;
-            COLORREF text = self->m_pApp != nullptr ? self->m_pApp->GetColor(L"PanelText") : CLR_INVALID;
-            if (back == CLR_INVALID) back = GetSysColor(COLOR_WINDOW);
-            if (text == CLR_INVALID) text = GetSysColor(COLOR_WINDOWTEXT);
-            SetBkColor(dc, back);
-            SetTextColor(dc, text);
-            if (self->m_panelBackBrush == nullptr || self->m_panelBackBrushColor != back) {
-                if (self->m_panelBackBrush != nullptr) DeleteObject(self->m_panelBackBrush);
-                self->m_panelBackBrush = CreateSolidBrush(back);
-                self->m_panelBackBrushColor = back;
-            }
-            return reinterpret_cast<LRESULT>(self->m_panelBackBrush);
-        }
-        break;
-    }
 
     case WM_CTLCOLORSTATIC: {
         HWND control = reinterpret_cast<HWND>(lParam);
         if (control == self->m_panelStatus) {
             HDC dc = reinterpret_cast<HDC>(wParam);
-            COLORREF back = self->m_pApp != nullptr ? self->m_pApp->GetColor(L"PanelBack") : CLR_INVALID;
-            COLORREF text = self->m_pApp != nullptr ? self->m_pApp->GetColor(L"PanelText") : CLR_INVALID;
-            if (back == CLR_INVALID) back = GetSysColor(COLOR_WINDOW);
-            if (text == CLR_INVALID) text = GetSysColor(COLOR_WINDOWTEXT);
-            SetBkColor(dc, back);
-            SetTextColor(dc, text);
-            if (self->m_panelBackBrush == nullptr || self->m_panelBackBrushColor != back) {
-                if (self->m_panelBackBrush != nullptr) DeleteObject(self->m_panelBackBrush);
-                self->m_panelBackBrush = CreateSolidBrush(back);
-                self->m_panelBackBrushColor = back;
-            }
-            return reinterpret_cast<LRESULT>(self->m_panelBackBrush);
-        }
-        break;
-    }
-
-    case WM_MEASUREITEM: {
-        auto *measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
-        if (measure != nullptr && measure->CtlID == kControlList) {
-            // 現在番組はコンパクトさを維持し、未来番組だけ少し縦余白を広げる。
-            if (measure->itemID != static_cast<UINT>(-1) &&
-                static_cast<size_t>(measure->itemID) < self->m_panelRows.size() &&
-                self->m_panelRows[measure->itemID].IsFuture) {
-                measure->itemHeight = kPanelFutureRowHeight;
-            } else {
-                measure->itemHeight = kPanelCurrentRowHeight;
-            }
-            return TRUE;
-        }
-        break;
-    }
-
-    case WM_DRAWITEM: {
-        auto *draw = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
-        if (draw != nullptr && draw->CtlID == kControlList) {
-            self->DrawPanelRow(draw);
-            return TRUE;
-        }
-        if (draw != nullptr && (draw->CtlID == kControlWaveGr || draw->CtlID == kControlWaveBs || draw->CtlID == kControlWaveCs || draw->CtlID == kControlWaveCatv)) {
-            self->DrawPanelWaveButton(draw);
-            return TRUE;
+            const PanelHostPalette palette = ResolvePanelHostPalette(self->m_pApp);
+            SetBkColor(dc, palette.Back);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, palette.Text);
+            return reinterpret_cast<LRESULT>(self->EnsurePanelBackBrush(palette.Back));
         }
         break;
     }
 
     case WM_SIZE:
-        self->LayoutPanel(LOWORD(lParam), HIWORD(lParam));
+        self->LayoutPanel();
+        return 0;
+
+    case kPanelUiStateMessage:
+        self->UpdateAutomationControls();
+        self->UpdatePanelViewingProjection(wParam != 0);
         return 0;
 
     case WM_TIMER:
         if (wParam == kPanelRefreshTimerId) {
-            self->RefreshPanelRows(false);
+            self->RefreshPanelDisplay(false);
             return 0;
         }
         if (wParam == kPanelMarqueeDelayTimerId) {
             KillTimer(hwnd, kPanelMarqueeDelayTimerId);
-            if (self->m_panelList != nullptr && self->m_panelHoverRow >= 0 &&
+            if (self->m_panelViewport != nullptr && self->m_panelHoverRow >= 0 &&
                 static_cast<size_t>(self->m_panelHoverRow) < self->m_panelRows.size() &&
                 self->m_panelRows[static_cast<size_t>(self->m_panelHoverRow)].NeedsMarquee) {
                 self->m_panelMarqueeActive = true;
                 self->m_panelMarqueeEpochTick = GetTickMs();
                 RECT item{};
-                if (SendMessageW(self->m_panelList, LB_GETITEMRECT,
-                    static_cast<WPARAM>(self->m_panelHoverRow), reinterpret_cast<LPARAM>(&item)) != LB_ERR) {
-                    InvalidateRect(self->m_panelList, &item, FALSE);
+                if (self->GetPanelViewportRowRect(self->m_panelHoverRow, &item)) {
+                    InvalidateRect(self->m_panelViewport, &item, FALSE);
                 }
                 SetTimer(hwnd, kPanelMarqueeTimerId, kPanelMarqueeIntervalMs, nullptr);
             }
             return 0;
         }
         if (wParam == kPanelMarqueeTimerId) {
-            if (self->m_panelMarqueeActive && self->m_panelList != nullptr && self->m_panelHoverRow >= 0 &&
+            if (self->m_panelMarqueeActive && self->m_panelViewport != nullptr && self->m_panelHoverRow >= 0 &&
                 static_cast<size_t>(self->m_panelHoverRow) < self->m_panelRows.size() &&
                 self->m_panelRows[static_cast<size_t>(self->m_panelHoverRow)].NeedsMarquee) {
                 RECT item{};
-                if (SendMessageW(self->m_panelList, LB_GETITEMRECT,
-                    static_cast<WPARAM>(self->m_panelHoverRow), reinterpret_cast<LPARAM>(&item)) != LB_ERR) {
+                if (self->GetPanelViewportRowRect(self->m_panelHoverRow, &item)) {
                     // ホバー中の1行について、通常描画と同じレイアウト計算からタイトル列だけを更新する。
-                    HDC layoutDc = GetDC(self->m_panelList);
-                    HFONT layoutFont = reinterpret_cast<HFONT>(SendMessageW(self->m_panelList, WM_GETFONT, 0, 0));
+                    HDC layoutDc = GetDC(self->m_panelViewport);
+                    HFONT layoutFont = self->m_panelFont != nullptr ? self->m_panelFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
                     HGDIOBJ oldLayoutFont = nullptr;
                     if (layoutDc != nullptr && layoutFont != nullptr) {
                         oldLayoutFont = SelectObject(layoutDc, layoutFont);
@@ -1747,13 +2514,13 @@ LRESULT CALLBACK CViewReservationPlugin::PanelWindowProc(HWND hwnd, UINT message
                         SelectObject(layoutDc, oldLayoutFont);
                     }
                     if (layoutDc != nullptr) {
-                        ReleaseDC(self->m_panelList, layoutDc);
+                        ReleaseDC(self->m_panelViewport, layoutDc);
                     }
 
                     RECT dirty = layout.Content;
                     dirty.left = layout.TitleLeft;
                     if (dirty.right > dirty.left) {
-                        InvalidateRect(self->m_panelList, &dirty, FALSE);
+                        InvalidateRect(self->m_panelViewport, &dirty, FALSE);
                     }
                 }
             } else {
@@ -1768,9 +2535,7 @@ LRESULT CALLBACK CViewReservationPlugin::PanelWindowProc(HWND hwnd, UINT message
         HDC dc = reinterpret_cast<HDC>(wParam);
         RECT rc{};
         GetClientRect(hwnd, &rc);
-        COLORREF back = self->m_pApp != nullptr ? self->m_pApp->GetColor(L"PanelBack") : CLR_INVALID;
-        if (back == CLR_INVALID) back = GetSysColor(COLOR_WINDOW);
-        FillSolid(dc, rc, back);
+        FillSolid(dc, rc, ResolvePanelHostPalette(self->m_pApp).Back);
         return 1;
     }
 
@@ -1793,38 +2558,316 @@ LRESULT CALLBACK CViewReservationPlugin::PanelWindowProc(HWND hwnd, UINT message
             self->SetPanelWave(PanelWave::Catv);
             return 0;
         }
+        if (id == kControlRefresh && notify == BN_CLICKED) {
+            self->RefreshPanelDisplay(true);
+            return 0;
+        }
+        if (id == kControlPower && notify == BN_CLICKED) {
+            self->RequestTvTestClose();
+            return 0;
+        }
         break;
     }
 
     case WM_DESTROY:
-        KillTimer(hwnd, kPanelRefreshTimerId);
-        KillTimer(hwnd, kPanelMarqueeTimerId);
-        KillTimer(hwnd, kPanelMarqueeDelayTimerId);
-        if (self->m_panelList != nullptr && self->m_panelListOriginalProc != nullptr) {
-            SetWindowLongPtrW(self->m_panelList, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(self->m_panelListOriginalProc));
-            RemovePropW(self->m_panelList, L"ViewReservation.PanelSelf");
-        }
-        if (self->m_panelFont != nullptr) {
-            DeleteObject(self->m_panelFont);
-            self->m_panelFont = nullptr;
-        }
-        if (self->m_panelBackBrush != nullptr) {
-            DeleteObject(self->m_panelBackBrush);
-            self->m_panelBackBrush = nullptr;
-            self->m_panelBackBrushColor = CLR_INVALID;
-        }
-        if (self->m_panelWindow == hwnd) {
-            self->m_panelWindow = nullptr;
-            self->m_panelList = nullptr;
-            self->m_panelStatus = nullptr;
-            self->m_panelListOriginalProc = nullptr;
-            self->m_panelRows.clear();
-            self->m_panelExpandedChannels.clear();
-        }
+        self->ReleasePanelWindowResources(hwnd);
         return 0;
     }
 
     return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+std::vector<DriverChannelEntry> CViewReservationPlugin::GetDisplayChannelsForWave(PanelWave wave, bool forceDriverCache) {
+    if (m_pApp == nullptr) return {};
+    m_driverCache.RebuildIfNeeded(m_pApp, forceDriverCache);
+    auto channels = m_driverCache.SnapshotDisplayServices();
+    channels.erase(std::remove_if(channels.begin(), channels.end(), [wave](const DriverChannelEntry &entry) {
+        return ResolvePanelWave(entry) != wave;
+    }), channels.end());
+    return channels;
+}
+
+void CViewReservationPlugin::PostPanelUiStateRefresh(bool centerCurrent) const {
+    HWND hwnd = m_panelWindow;
+    if (hwnd != nullptr) PostMessageW(hwnd, kPanelUiStateMessage, centerCurrent ? 1 : 0, 0);
+}
+
+void CViewReservationPlugin::UpdateAutomationControls() {
+    if (m_panelAutomationBar == nullptr) return;
+    InvalidateRect(m_panelAutomationBar, nullptr, FALSE);
+}
+
+void CViewReservationPlugin::ShowExitHoursMenu() {
+    if (m_panelWindow == nullptr || m_panelAutomationBar == nullptr) return;
+
+    int current = ViewReservationSettings::DefaultExitTimerHours;
+    bool active = false;
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        current = m_exitTimerHours;
+        active = m_exitTimerActive;
+    }
+    HDC dc = GetDC(m_panelAutomationBar);
+    const auto layout = CalculateAutomationBarLayout(dc);
+    if (dc != nullptr) {
+        ReleaseDC(m_panelAutomationBar, dc);
+    }
+    if (active || layout.ExitHours.Empty()) return;
+
+    HMENU menu = CreatePopupMenu();
+    if (menu == nullptr) return;
+    for (int value = ViewReservationSettings::ExitTimerMinHours; value <= ViewReservationSettings::ExitTimerMaxHours; ++value) {
+        const std::wstring label = std::to_wstring(value) + L"h";
+        UINT flags = MF_STRING;
+        if (value == current) flags |= MF_CHECKED;
+        AppendMenuW(menu, flags, static_cast<UINT_PTR>(value), label.c_str());
+    }
+
+    POINT anchor{
+        static_cast<LONG>(layout.ExitHours.Left),
+        static_cast<LONG>(layout.ExitHours.Bottom)
+    };
+    ClientToScreen(m_panelAutomationBar, &anchor);
+    const int command = TrackPopupMenu(menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
+        anchor.x, anchor.y, 0, m_panelWindow, nullptr);
+    DestroyMenu(menu);
+
+    const int value = command;
+    if (ViewReservationSettings::IsSupportedExitTimerHours(value)) {
+        {
+            std::lock_guard<std::mutex> lock(m_automationMutex);
+            m_exitTimerHours = value;
+        }
+        SaveExitTimerHours(value);
+        UpdateAutomationControls();
+    }
+}
+
+void CViewReservationPlugin::StartZapping() {
+    const PanelWave wave = m_panelWave;
+    auto channels = GetDisplayChannelsForWave(wave, true);
+    if (channels.size() < 2) {
+        Log(L"ザッピング対象の局が2局以上ありません。");
+        PostPanelUiStateRefresh();
+        return;
+    }
+
+    TVTest::ChannelInfo current{};
+    current.Size = sizeof(current);
+    ULONGLONG currentKey = 0;
+    if (m_pApp != nullptr && m_pApp->GetCurrentChannelInfo(&current)) {
+        currentKey = (static_cast<ULONGLONG>(current.NetworkID) << 32) |
+            (static_cast<ULONGLONG>(current.TransportStreamID) << 16) |
+            static_cast<ULONGLONG>(current.ServiceID);
+    }
+
+    const ULONGLONG now = GetTickMs();
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        ++m_zappingGeneration;
+        m_zappingActive = true;
+        m_zappingHasSwitched = false;
+        m_zappingWave = wave;
+        m_zappingLastChannelKey = currentKey;
+        m_zappingNextTick = now + static_cast<ULONGLONG>(m_zappingIntervalSeconds) * 1000ULL;
+    }
+    PostPanelUiStateRefresh(true);
+    m_cv.notify_all();
+}
+
+void CViewReservationPlugin::StopZapping() {
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        ++m_zappingGeneration;
+        m_zappingActive = false;
+        m_zappingHasSwitched = false;
+        m_zappingNextTick = 0;
+        m_zappingLastChannelKey = 0;
+    }
+    PostPanelUiStateRefresh();
+    m_cv.notify_all();
+}
+
+void CViewReservationPlugin::StartExitTimer() {
+    const ULONGLONG now = GetTickMs();
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        ++m_exitTimerGeneration;
+        m_exitTimerActive = true;
+        m_exitWaitingForRecording = false;
+        m_exitDeadlineTick = now + static_cast<ULONGLONG>(m_exitTimerHours) * 60ULL * 60ULL * 1000ULL;
+    }
+    PostPanelUiStateRefresh();
+    m_cv.notify_all();
+}
+
+void CViewReservationPlugin::StopExitTimer() {
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        ++m_exitTimerGeneration;
+        m_exitTimerActive = false;
+        m_exitWaitingForRecording = false;
+        m_exitDeadlineTick = 0;
+    }
+    PostPanelUiStateRefresh();
+    m_cv.notify_all();
+}
+
+void CViewReservationPlugin::RunZappingTick(ULONGLONG nowTick) {
+    PanelWave wave = PanelWave::Terrestrial;
+    int intervalSeconds = ViewReservationSettings::DefaultZappingIntervalSeconds;
+    bool hasSwitched = false;
+    ULONGLONG generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        if (!m_zappingActive || nowTick < m_zappingNextTick) return;
+        wave = m_zappingWave;
+        intervalSeconds = m_zappingIntervalSeconds;
+        hasSwitched = m_zappingHasSwitched;
+        generation = m_zappingGeneration;
+    }
+
+    auto postpone = [&]() {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        if (m_zappingActive && m_zappingGeneration == generation) {
+            m_zappingNextTick = GetTickMs() + static_cast<ULONGLONG>(intervalSeconds) * 1000ULL;
+        }
+    };
+
+    if (IsRecordingActive() || HasPendingRecording()) {
+        postpone();
+        return;
+    }
+    if (m_manager != nullptr) {
+        const auto reservations = m_manager->Snapshot();
+        for (const auto &item : reservations) {
+            if (!item.Triggered && IsReservationTriggerWindow(item)) {
+                postpone();
+                return;
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> operationLock(m_zappingOperationMutex);
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        if (!m_zappingActive || m_zappingGeneration != generation) return;
+    }
+
+    auto channels = GetDisplayChannelsForWave(wave, false);
+    if (channels.size() < 2) {
+        StopZapping();
+        return;
+    }
+
+    TVTest::ChannelInfo current{};
+    current.Size = sizeof(current);
+    ULONGLONG currentKey = 0;
+    bool haveCurrent = m_pApp != nullptr && m_pApp->GetCurrentChannelInfo(&current);
+    if (haveCurrent) {
+        currentKey = (static_cast<ULONGLONG>(current.NetworkID) << 32) |
+            (static_cast<ULONGLONG>(current.TransportStreamID) << 16) |
+            static_cast<ULONGLONG>(current.ServiceID);
+        DriverChannelEntry currentEntry{};
+        currentEntry.NetworkID = current.NetworkID;
+        currentEntry.TransportStreamID = current.TransportStreamID;
+        currentEntry.ServiceID = current.ServiceID;
+        const PanelWave currentWave = ResolvePanelWave(currentEntry);
+        if (hasSwitched && current.NetworkID != 0 && currentWave != wave) {
+            StopZapping();
+            return;
+        }
+    }
+
+    ULONGLONG lastKey = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        if (!m_zappingActive || m_zappingGeneration != generation) return;
+        lastKey = m_zappingLastChannelKey;
+    }
+
+    int lastIndex = -1;
+    if (currentKey != 0) {
+        for (size_t i = 0; i < channels.size(); ++i) {
+            if (MakeChannelServiceKey(channels[i]) == currentKey) { lastIndex = static_cast<int>(i); break; }
+        }
+    }
+    if (lastIndex < 0 && lastKey != 0) {
+        for (size_t i = 0; i < channels.size(); ++i) {
+            if (MakeChannelServiceKey(channels[i]) == lastKey) { lastIndex = static_cast<int>(i); break; }
+        }
+    }
+
+    const size_t nextIndex = static_cast<size_t>((lastIndex + 1) % static_cast<int>(channels.size()));
+    const DriverChannelEntry &target = channels[nextIndex];
+    ReservationItem item{};
+    item.NetworkID = target.NetworkID;
+    item.TransportStreamID = target.TransportStreamID;
+    item.ServiceID = target.ServiceID;
+    item.OriginalNetworkID = target.NetworkID;
+    item.OriginalTransportStreamID = target.TransportStreamID;
+    item.OriginalServiceID = target.ServiceID;
+    item.EventName = target.ChannelName;
+    item.LastDriverName = target.DriverName;
+
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        if (!m_zappingActive || m_zappingGeneration != generation) return;
+    }
+    if (!TrySwitchToItem(item, L"ザッピング")) {
+        StopZapping();
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        if (!m_zappingActive || m_zappingGeneration != generation) return;
+        m_zappingHasSwitched = true;
+        m_zappingLastChannelKey = MakeChannelServiceKey(target);
+        m_zappingNextTick = GetTickMs() + static_cast<ULONGLONG>(intervalSeconds) * 1000ULL;
+    }
+    PostPanelUiStateRefresh(true);
+}
+
+void CViewReservationPlugin::RunExitTimerTick(ULONGLONG nowTick) {
+    ULONGLONG generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        if (!m_exitTimerActive || nowTick < m_exitDeadlineTick) return;
+        generation = m_exitTimerGeneration;
+    }
+
+    if (IsRecordingActive() || HasPendingRecording()) {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        if (m_exitTimerActive && m_exitTimerGeneration == generation) {
+            m_exitWaitingForRecording = true;
+        }
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        if (!m_exitTimerActive || m_exitTimerGeneration != generation) return;
+        m_exitTimerActive = false;
+        m_exitWaitingForRecording = false;
+        m_exitDeadlineTick = 0;
+    }
+    RequestTvTestClose();
+}
+
+void CViewReservationPlugin::RequestTvTestClose() {
+    StopZapping();
+    PostPanelUiStateRefresh();
+    std::lock_guard<std::mutex> operationLock(m_zappingOperationMutex);
+    HWND appWindow = m_pApp != nullptr ? m_pApp->GetAppWindow() : nullptr;
+    if (appWindow != nullptr) PostMessageW(appWindow, WM_CLOSE, 0, 0);
+}
+
+void CViewReservationPlugin::RunAutomationTick() {
+    const ULONGLONG now = GetTickMs();
+    RunExitTimerTick(now);
+    RunZappingTick(now);
 }
 
 void CViewReservationPlugin::Log(const std::wstring &text) {
@@ -1855,7 +2898,7 @@ std::wstring CViewReservationPlugin::QueryEventName(const TVTest::ProgramGuidePr
         return L"";
     }
 
-    const std::wstring name = TrimText(eventInfo->pszEventName);
+    const std::wstring name = CopyOptionalText(eventInfo->pszEventName);
     m_pApp->FreeEpgEventInfo(eventInfo);
     return name;
 }
@@ -1888,24 +2931,12 @@ int CViewReservationPlugin::OnProgramGuideProgramInitializeMenu(
         return 0;
     }
 
-    // 予約状態を取得（番組情報更新でIDが変わっている場合はOriginalIDでも照合）
-    bool isReserved = false;
-    bool isRecord = false;
-    {
-        const auto list = m_manager->Snapshot();
-        for (const auto &item : list) {
-            if (MatchesProgramIdentity(
-                    item,
-                    pProgramInfo->NetworkID,
-                    pProgramInfo->TransportStreamID,
-                    pProgramInfo->ServiceID,
-                    pProgramInfo->EventID)) {
-                isReserved = true;
-                isRecord = item.RecordOnTrigger;
-                break;
-            }
-        }
-    }
+    const auto reservations = m_manager->Snapshot();
+    const ReservationItem *existingReservation = FindMatchingReservation(
+        reservations, pProgramInfo->NetworkID, pProgramInfo->TransportStreamID,
+        pProgramInfo->ServiceID, pProgramInfo->EventID);
+    const bool isReserved = existingReservation != nullptr;
+    const bool isRecord = isReserved && existingReservation->RecordOnTrigger;
 
     int count = 0;
 
@@ -1917,14 +2948,12 @@ int CViewReservationPlugin::OnProgramGuideProgramInitializeMenu(
             pInfo->Command + kMenuCommandRecord, L"録画予約");
         count = 2;
     } else if (!isRecord) {
-        // 視聴予約済み：Command+0で解除（kMenuCommandReserve=0）
+        // 予約済みメニューはCommand+0の1項目で解除する。
         AppendMenuW(pInfo->hmenu, MF_STRING | MF_CHECKED,
             pInfo->Command + kMenuCommandReserve, L"視聴予約解除");
         count = 1;
     } else {
-        // 録画予約済み：Command+0で解除（kMenuCommandRecordの代わりにCommand+0を使う）
-        // TVTestはcount分だけCommand+0から順に割り当てるため、
-        // 必ずCommand+0から追加しないとMenuSelectedが呼ばれない
+        // 予約済みメニューはCommand+0の1項目で解除する。
         AppendMenuW(pInfo->hmenu, MF_STRING | MF_CHECKED,
             pInfo->Command + kMenuCommandReserve, L"録画予約解除");
         count = 1;
@@ -1944,35 +2973,18 @@ bool CViewReservationPlugin::OnProgramGuideProgramMenuSelected(
         return false;
     }
 
-    // Commandは追加した項目の0始まりインデックス
-    // 未予約時：0=視聴予約、1=録画予約
-    // 予約済み時：0=解除（1項目のみ）
-    // isRecord/isReservedはメニュー表示時と同じ判定で種別を確認する
-    bool isReservedCmd = false;
-    bool isRecordCmd = false;
-    {
-        const auto list = m_manager->Snapshot();
-        for (const auto &existing : list) {
-            if (MatchesProgramIdentity(
-                    existing,
-                    pProgramInfo->NetworkID,
-                    pProgramInfo->TransportStreamID,
-                    pProgramInfo->ServiceID,
-                    pProgramInfo->EventID)) {
-                isReservedCmd = true;
-                isRecordCmd = existing.RecordOnTrigger;
-                break;
-            }
-        }
-    }
+    const auto reservations = m_manager->Snapshot();
+    const ReservationItem *existingReservation = FindMatchingReservation(
+        reservations, pProgramInfo->NetworkID, pProgramInfo->TransportStreamID,
+        pProgramInfo->ServiceID, pProgramInfo->EventID);
+    const bool isReservedCmd = existingReservation != nullptr;
+    const bool isRecordCmd = isReservedCmd && existingReservation->RecordOnTrigger;
 
     ReservationItem item = MakeReservationItem(*pProgramInfo);
 
     if (isReservedCmd) {
-        // 予約済み→解除（Command=0の1項目のみ、種別はDBから取得）
         item.RecordOnTrigger = isRecordCmd;
     } else {
-        // 未予約→登録（Command=0:視聴予約、Command=1:録画予約）
         if (Command == kMenuCommandRecord) {
             item.RecordOnTrigger = true;
         }
@@ -1980,29 +2992,13 @@ bool CViewReservationPlugin::OnProgramGuideProgramMenuSelected(
 
     std::wstring message;
 
-    // 同じ種別の予約が既にあれば解除、なければ登録
-    // EventIDは番組情報更新で変わる場合があるためOriginalIDも照合し、
-    // 削除時はDB上の実際のIDを使う
     bool foundInDb = false;
-    {
-        const auto list = m_manager->Snapshot();
-        for (const auto &existing : list) {
-            if (existing.RecordOnTrigger != item.RecordOnTrigger) continue;
-            if (MatchesProgramIdentity(
-                    existing,
-                    item.NetworkID,
-                    item.TransportStreamID,
-                    item.ServiceID,
-                    item.EventID)) {
-                // DB上の実際のIDをitemに反映して削除に使う
-                item.NetworkID = existing.NetworkID;
-                item.TransportStreamID = existing.TransportStreamID;
-                item.ServiceID = existing.ServiceID;
-                item.EventID = existing.EventID;
-                foundInDb = true;
-                break;
-            }
-        }
+    if (existingReservation != nullptr && existingReservation->RecordOnTrigger == item.RecordOnTrigger) {
+        item.NetworkID = existingReservation->NetworkID;
+        item.TransportStreamID = existingReservation->TransportStreamID;
+        item.ServiceID = existingReservation->ServiceID;
+        item.EventID = existingReservation->EventID;
+        foundInDb = true;
     }
 
     bool reservationChanged = false;
@@ -2056,62 +3052,46 @@ void CViewReservationPlugin::WorkerLoop() {
 }
 
 ULONGLONG CViewReservationPlugin::ComputeNextWakeDelayMs() const {
-    // 録画要求のサービス到達待ちは短周期で確認する。固定待機はしない。
-    if (HasPendingRecording()) {
-        return kMinSleepMs;
-    }
-
-    if (m_manager == nullptr) {
-        return kBaseCheckIntervalMs;
-    }
-
-    const auto list = m_manager->Snapshot();
-    if (list.empty()) {
-        return kIdleSleepMs;
-    }
-
     const ULONGLONG nowTick = GetTickMs();
-    ULONGLONG best = kMaxSleepMs;
+    ULONGLONG best = kIdleSleepMs;
 
-    for (const auto &item : list) {
-        const ULONGLONG secUntil = SecondsUntil(item.StartTime);
-
-        if (!item.Triggered) {
-            if (secUntil <= kBeforeSwitchSec) {
-                return kMinSleepMs;
-            }
-
-            const ULONGLONG untilSwitchMs = (secUntil - kBeforeSwitchSec) * 1000ULL;
-            if (untilSwitchMs < best) {
-                best = untilSwitchMs;
-            }
-        }
-
-        ULONGLONG syncIntervalMs = 5000ULL;
-        if (secUntil > 24 * 60 * 60) {
-            syncIntervalMs = 30 * 60 * 1000ULL;
-        } else if (secUntil > 6 * 60 * 60) {
-            syncIntervalMs = 10 * 60 * 1000ULL;
-        } else if (secUntil > 60 * 60) {
-            syncIntervalMs = 60 * 1000ULL;
-        } else if (secUntil > 10 * 60) {
-            syncIntervalMs = 15 * 1000ULL;
-        }
-
-        const ULONGLONG nextSyncMs =
-            item.LastEpgSyncTick == 0 ? 0 :
-            (item.LastEpgSyncTick + syncIntervalMs <= nowTick ? 0 : (item.LastEpgSyncTick + syncIntervalMs - nowTick));
-        if (nextSyncMs < best) {
-            best = nextSyncMs;
-        }
-    }
-
-    if (best < kMinSleepMs) {
+    if (HasPendingRecording()) {
         best = kMinSleepMs;
     }
-    if (best > kMaxSleepMs) {
-        best = kMaxSleepMs;
+
+    {
+        std::lock_guard<std::mutex> lock(m_automationMutex);
+        if (m_zappingActive) {
+            const ULONGLONG due = m_zappingNextTick <= nowTick ? 0 : m_zappingNextTick - nowTick;
+            best = (std::min)(best, due);
+        }
+        if (m_exitTimerActive) {
+            const ULONGLONG due = m_exitDeadlineTick <= nowTick ? 0 : m_exitDeadlineTick - nowTick;
+            best = (std::min)(best, m_exitWaitingForRecording ? kMinSleepMs : due);
+        }
     }
+
+    if (m_manager != nullptr) {
+        const auto list = m_manager->Snapshot();
+        for (const auto &item : list) {
+            const ULONGLONG secUntil = SecondsUntil(item.StartTime);
+            if (!item.Triggered) {
+                if (secUntil <= kBeforeSwitchSec) {
+                    best = (std::min)(best, kMinSleepMs);
+                } else {
+                    best = (std::min)(best, (secUntil - kBeforeSwitchSec) * 1000ULL);
+                }
+            }
+
+            const ULONGLONG syncIntervalMs = ViewReservationSchedule::EpgSyncIntervalMs(secUntil);
+            const ULONGLONG nextSyncMs = item.LastEpgSyncTick == 0 ? 0 :
+                (item.LastEpgSyncTick + syncIntervalMs <= nowTick ? 0 : item.LastEpgSyncTick + syncIntervalMs - nowTick);
+            best = (std::min)(best, nextSyncMs);
+        }
+    }
+
+    if (best < kMinSleepMs) best = kMinSleepMs;
+    if (best > kMaxSleepMs) best = kMaxSleepMs;
     return best;
 }
 
@@ -2131,19 +3111,19 @@ bool CViewReservationPlugin::IsSameLocalDate(const SYSTEMTIME &a, const SYSTEMTI
 bool CViewReservationPlugin::IsReservationActiveNow(const ReservationItem &item) const {
     SYSTEMTIME now{};
     GetLocalTime(&now);
-    const ULONGLONG nowFt = FileTimeOf(now);
-    const ULONGLONG startFt = FileTimeOf(item.StartTime);
-    const ULONGLONG endFt = startFt + static_cast<ULONGLONG>(item.Duration) * 10000000ULL;
+    const ULONGLONG nowFt = ViewReservationTime::FileTimeValue(now);
+    const ULONGLONG startFt = ViewReservationTime::FileTimeValue(item.StartTime);
+    const ULONGLONG endFt = startFt + static_cast<ULONGLONG>(item.Duration) * ViewReservationTime::TicksPerSecond;
     return nowFt >= startFt && nowFt < endFt;
 }
 
 bool CViewReservationPlugin::IsReservationTriggerWindow(const ReservationItem &item) const {
     SYSTEMTIME now{};
     GetLocalTime(&now);
-    const ULONGLONG nowFt = FileTimeOf(now);
-    const ULONGLONG startFt = FileTimeOf(item.StartTime);
-    const ULONGLONG triggerFt = startFt - kBeforeSwitchSec * 10000000ULL;
-    const ULONGLONG endFt = startFt + static_cast<ULONGLONG>(item.Duration) * 10000000ULL;
+    const ULONGLONG nowFt = ViewReservationTime::FileTimeValue(now);
+    const ULONGLONG startFt = ViewReservationTime::FileTimeValue(item.StartTime);
+    const ULONGLONG triggerFt = startFt - kBeforeSwitchSec * ViewReservationTime::TicksPerSecond;
+    const ULONGLONG endFt = startFt + static_cast<ULONGLONG>(item.Duration) * ViewReservationTime::TicksPerSecond;
     return nowFt >= triggerFt && nowFt < endFt;
 }
 
@@ -2160,8 +3140,8 @@ int CViewReservationPlugin::SelectSingleReservationIndexToTrigger(const std::vec
             if (bestActive < 0) {
                 bestActive = static_cast<int>(i);
             } else {
-                const ULONGLONG currentStart = FileTimeOf(item.StartTime);
-                const ULONGLONG bestStart = FileTimeOf(items[bestActive].StartTime);
+                const ULONGLONG currentStart = ViewReservationTime::FileTimeValue(item.StartTime);
+                const ULONGLONG bestStart = ViewReservationTime::FileTimeValue(items[bestActive].StartTime);
                 if (currentStart > bestStart || (currentStart == bestStart && static_cast<int>(i) > bestActive)) {
                     bestActive = static_cast<int>(i);
                 }
@@ -2170,8 +3150,8 @@ int CViewReservationPlugin::SelectSingleReservationIndexToTrigger(const std::vec
             if (bestUpcoming < 0) {
                 bestUpcoming = static_cast<int>(i);
             } else {
-                const ULONGLONG currentStart = FileTimeOf(item.StartTime);
-                const ULONGLONG bestStart = FileTimeOf(items[bestUpcoming].StartTime);
+                const ULONGLONG currentStart = ViewReservationTime::FileTimeValue(item.StartTime);
+                const ULONGLONG bestStart = ViewReservationTime::FileTimeValue(items[bestUpcoming].StartTime);
                 if (currentStart < bestStart || (currentStart == bestStart && static_cast<int>(i) > bestUpcoming)) {
                     bestUpcoming = static_cast<int>(i);
                 }
@@ -2209,11 +3189,11 @@ void CViewReservationPlugin::ReleaseTriggerKey(const std::wstring &key) {
 
 
 void CViewReservationPlugin::RunMaintenanceTick() {
-    if (m_manager == nullptr || m_pApp == nullptr) {
-        return;
-    }
+    if (m_pApp == nullptr) return;
 
     try {
+        RunAutomationTick();
+        if (m_manager == nullptr) return;
         // チャンネル切替後は、目的サービスへ到達したことを確認してから録画する。
         TryCompletePendingRecording();
 
@@ -2264,27 +3244,18 @@ ULONGLONG CViewReservationPlugin::GetTickMs() {
     return GetTickCount64();
 }
 
-ULONGLONG CViewReservationPlugin::FileTimeOf(const SYSTEMTIME &st) {
-    FILETIME ft{};
-    SystemTimeToFileTime(&st, &ft);
-    ULARGE_INTEGER ui{};
-    ui.LowPart = ft.dwLowDateTime;
-    ui.HighPart = ft.dwHighDateTime;
-    return ui.QuadPart;
-}
-
 ULONGLONG CViewReservationPlugin::SecondsUntil(const SYSTEMTIME &st) {
     SYSTEMTIME now{};
     GetLocalTime(&now);
 
-    const ULONGLONG a = FileTimeOf(now);
-    const ULONGLONG b = FileTimeOf(st);
+    const ULONGLONG a = ViewReservationTime::FileTimeValue(now);
+    const ULONGLONG b = ViewReservationTime::FileTimeValue(st);
 
     if (b <= a) {
         return 0;
     }
 
-    return (b - a) / 10000000ULL;
+    return (b - a) / ViewReservationTime::TicksPerSecond;
 }
 
 std::wstring CViewReservationPlugin::ToLowerSimple(std::wstring text) {
@@ -2326,9 +3297,9 @@ int CViewReservationPlugin::ComputeNameSimilarityScore(const std::wstring &a, co
 int CViewReservationPlugin::ComputeCandidateScore(const ReservationItem &base, const ReservationItem &candidate) {
     int score = ComputeNameSimilarityScore(base.EventName, candidate.EventName);
 
-    const ULONGLONG baseTime = FileTimeOf(base.StartTime);
-    const ULONGLONG candTime = FileTimeOf(candidate.StartTime);
-    const ULONGLONG diffSec = (baseTime > candTime ? (baseTime - candTime) : (candTime - baseTime)) / 10000000ULL;
+    const ULONGLONG baseTime = ViewReservationTime::FileTimeValue(base.StartTime);
+    const ULONGLONG candTime = ViewReservationTime::FileTimeValue(candidate.StartTime);
+    const ULONGLONG diffSec = (baseTime > candTime ? (baseTime - candTime) : (candTime - baseTime)) / ViewReservationTime::TicksPerSecond;
 
     if (diffSec <= 60) {
         score += 60;
@@ -2371,21 +3342,7 @@ bool CViewReservationPlugin::IsSyncDue(const ReservationItem &item) {
         return true;
     }
 
-    const ULONGLONG secUntil = SecondsUntil(item.StartTime);
-    ULONGLONG intervalMs = 5000ULL;
-
-    if (secUntil > 24 * 60 * 60) {
-        intervalMs = 30 * 60 * 1000ULL;
-    } else if (secUntil > 6 * 60 * 60) {
-        intervalMs = 10 * 60 * 1000ULL;
-    } else if (secUntil > 60 * 60) {
-        intervalMs = 60 * 1000ULL;
-    } else if (secUntil > 10 * 60) {
-        intervalMs = 15 * 1000ULL;
-    } else {
-        intervalMs = 5000ULL;
-    }
-
+    const ULONGLONG intervalMs = ViewReservationSchedule::EpgSyncIntervalMs(SecondsUntil(item.StartTime));
     return (now - item.LastEpgSyncTick) >= intervalMs;
 }
 
@@ -2426,7 +3383,7 @@ bool CViewReservationPlugin::TryDirectEpgSync(ReservationItem &item, std::wstrin
         return false;
     }
 
-    const std::wstring name = TrimText(eventInfo->pszEventName);
+    const std::wstring name = CopyOptionalText(eventInfo->pszEventName);
     const bool changed = m_manager->UpdateTimingByIds(
         item.NetworkID,
         item.TransportStreamID,
@@ -2479,7 +3436,7 @@ bool CViewReservationPlugin::TryRescueInService(WORD nid, WORD tsid, WORD sid, c
         candidate.OriginalEventID = item.OriginalEventID;
         candidate.StartTime = ev->StartTime;
         candidate.Duration = ev->Duration;
-        candidate.EventName = TrimText(ev->pszEventName);
+        candidate.EventName = CopyOptionalText(ev->pszEventName);
         candidate.LastDriverName = item.LastDriverName;
 
         const int score = ComputeCandidateScore(item, candidate);
@@ -2862,11 +3819,23 @@ void CViewReservationPlugin::TryCompletePendingRecording() {
 }
 
 bool CViewReservationPlugin::OnChannelChange() {
+    PostPanelUiStateRefresh(true);
     m_cv.notify_all();
     return true;
 }
 
 bool CViewReservationPlugin::OnServiceChange() {
+    PostPanelUiStateRefresh(true);
+    m_cv.notify_all();
+    return true;
+}
+
+bool CViewReservationPlugin::OnDriverChange() {
+    m_driverCache.Invalidate();
+    if (m_panelWindow != nullptr) {
+        RefreshPanelRows(true);
+        PostPanelUiStateRefresh(true);
+    }
     m_cv.notify_all();
     return true;
 }
@@ -2897,7 +3866,7 @@ bool CViewReservationPlugin::TryStartRecording(const ReservationItem &item, cons
         ULARGE_INTEGER uiStart{}, uiNow{};
         uiStart.LowPart = ftStart.dwLowDateTime; uiStart.HighPart = ftStart.dwHighDateTime;
         uiNow.LowPart   = ftNow.dwLowDateTime;   uiNow.HighPart   = ftNow.dwHighDateTime;
-        const ULONGLONG endValue = uiStart.QuadPart + static_cast<ULONGLONG>(item.Duration) * 10000000ULL;
+        const ULONGLONG endValue = uiStart.QuadPart + static_cast<ULONGLONG>(item.Duration) * ViewReservationTime::TicksPerSecond;
         if (endValue <= uiNow.QuadPart) return 0ULL;
         return (endValue - uiNow.QuadPart) / 10000ULL; // 100ns → ms
     }();
